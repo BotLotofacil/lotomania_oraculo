@@ -1,0 +1,2 @@
+python-telegram-bot==20.6
+numpy==1.26.4
