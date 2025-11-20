@@ -453,20 +453,47 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     e registra o desempenho.
     """
     try:
+        # 1) Verifica se existe o arquivo de última geração
         if not os.path.exists(ULTIMA_GERACAO_PATH):
             await update.message.reply_text(
-                "⚠️ Nenhum lote encontrado. Gere apostas primeiro com /gerar."
+                "⚠️ Nenhum lote encontrado.\n"
+                "Use primeiro o comando /gerar e depois /confirmar."
             )
             return
 
         if not context.args:
             await update.message.reply_text(
                 "Envie o comando assim:\n"
-                "/confirmar 00 01 02 ... 19 (20 dezenas do resultado oficial)."
+                "/confirmar 00 01 02 ... 19\n"
+                "(as 20 dezenas do resultado oficial da Lotomania)."
             )
             return
 
-        # Parse das 20 dezenas do resultado
+        # 2) Lê e valida o JSON da última geração
+        try:
+            with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
+                conteudo = f.read().strip()
+
+            if not conteudo:
+                # arquivo existe, mas está vazio
+                await update.message.reply_text(
+                    "⚠️ Arquivo de última geração está vazio.\n"
+                    "Use /gerar novamente para criar um novo bloco de apostas "
+                    "e depois execute /confirmar."
+                )
+                return
+
+            dados = json.loads(conteudo)
+
+        except json.JSONDecodeError:
+            await update.message.reply_text(
+                "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
+                "Use /gerar novamente para gerar um novo bloco de apostas "
+                "e depois execute /confirmar."
+            )
+            return
+
+        # 3) Parse das 20 dezenas do resultado informado
         dezenas_resultado = []
         for tok in context.args:
             tok = tok.strip().replace(",", "")
@@ -483,20 +510,23 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(dezenas_resultado) != 20:
             await update.message.reply_text(
-                f"Você informou {len(dezenas_resultado)} dezenas. "
+                f"Você informou {len(dezenas_resultado)} dezenas.\n"
                 "O resultado da Lotomania deve ter exatamente 20 dezenas."
             )
             return
 
         resultado_set = set(dezenas_resultado)
 
-        # Carrega último lote gerado
-        with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
-            dados = json.load(f)
-
         apostas = dados.get("apostas", [])
         espelhos = dados.get("espelhos", [])
         ts = dados.get("timestamp", time.time())
+
+        if not apostas or not espelhos:
+            await update.message.reply_text(
+                "⚠️ Não encontrei apostas válidas no arquivo de última geração.\n"
+                "Use /gerar novamente e depois /confirmar."
+            )
+            return
 
         labels = [
             "Aposta 1 – Repetição",
@@ -511,22 +541,17 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return len(set(lista) & resultado_set)
 
         linhas = [
-            "✅ *Confirmação de resultado (Oráculo Lotomania)*",
+            "✅ Confirmação de resultado (Oráculo Lotomania)",
             "",
             "Resultado informado:",
             " ".join(f"{d:02d}" for d in sorted(resultado_set)),
             "",
         ]
 
-        # Telemetria em memória
-        registro = {
-            "timestamp": ts,
-            "resultado": sorted(resultado_set),
-            "apostas": [],
-        }
-
         melhor_acertos = -1
         melhor_label = ""
+
+        registro_csv = []  # para escrever no desempenho_oraculo.csv
 
         for i, (ap, esp) in enumerate(zip(apostas, espelhos), start=1):
             acertos_ap = contar_acertos(ap)
@@ -540,22 +565,16 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 melhor_acertos = acertos_esp
                 melhor_label = f"{labels[i-1]} (espelho)"
 
-            linhas.append(f"*{labels[i-1]}*")
+            linhas.append(f"{labels[i-1]}")
             linhas.append(f"Principal: {acertos_ap} acertos")
             linhas.append(f"Espelho:   {acertos_esp} acertos")
             linhas.append("")
 
-            registro["apostas"].append(
-                {
-                    "tipo": labels[i-1],
-                    "acertos_principal": int(acertos_ap),
-                    "acertos_espelho": int(acertos_esp),
-                }
-            )
+            registro_csv.extend([acertos_ap, acertos_esp])
 
-        linhas.append(f"🏆 Melhor desempenho: *{melhor_label}* com {melhor_acertos} acertos.")
+        linhas.append(f"🏆 Melhor desempenho: {melhor_label} com {melhor_acertos} acertos.")
 
-        # Grava telemetria em CSV simples
+        # 4) Grava telemetria simples em CSV
         try:
             cabecalho = not os.path.exists(DESEMPENHO_PATH)
             import csv
@@ -575,15 +594,13 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ])
 
                 row = [ts, " ".join(f"{d:02d}" for d in sorted(resultado_set))]
-                for reg in registro["apostas"]:
-                    row.append(reg["acertos_principal"])
-                    row.append(reg["acertos_espelho"])
+                row.extend(registro_csv)
                 writer.writerow(row)
 
         except Exception as e_csv:
             logger.exception(f"Erro ao gravar telemetria: {e_csv}")
 
-        await update.message.reply_markdown("\n".join(linhas))
+        await update.message.reply_text("\n".join(linhas))
 
     except Exception as e:
         logger.exception("Erro no /confirmar")
