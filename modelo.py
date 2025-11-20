@@ -5,22 +5,25 @@ from tensorflow.keras.optimizers import Adam
 import os
 from dados import carregar_historico, carregar_estado, salvar_estado
 
-ARQUIVO_MODELO = "lotomania_model.npz"
+ARQUIVO_MODELO = "lotomania_model.h5"
 
-def criar_modelo(n_features=74):
+N_FEATURES = 100  # <-- CORRIGIDO (00 a 99)
+JANELA = 50       # quantidade de concursos usados para prever o próximo
+
+def criar_modelo():
     model = Sequential()
-    model.add(LSTM(64, input_shape=(50, n_features), return_sequences=False))
-    model.add(Dense(74, activation="sigmoid"))
+    model.add(LSTM(64, input_shape=(JANELA, N_FEATURES), return_sequences=False))
+    model.add(Dense(N_FEATURES, activation="sigmoid"))
     model.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
     return model
 
 def preparar_dados(df):
     X, y = [], []
-    dezenas_cols = [str(i) for i in range(74)]
+    dezenas_cols = [f"{i:02d}" for i in range(N_FEATURES)]
 
-    for i in range(len(df) - 50):
-        bloco = df[dezenas_cols].iloc[i:i+50].values
-        proximo = df[dezenas_cols].iloc[i+50].values
+    for i in range(len(df) - JANELA):
+        bloco = df[dezenas_cols].iloc[i:i+JANELA].values
+        proximo = df[dezenas_cols].iloc[i+JANELA].values
         X.append(bloco)
         y.append(proximo)
 
@@ -30,56 +33,44 @@ def treinar_modelo():
     df = carregar_historico()
     estado = carregar_estado()
 
-    ultimo_salvo = estado.get("ultimo_concurso_treinado")
     ultimo_atual = int(df["concurso"].iloc[-1])
 
-    # Carregar modelo existente
     if os.path.exists(ARQUIVO_MODELO):
         model = load_model(ARQUIVO_MODELO)
     else:
         model = criar_modelo()
 
-    # Preparar dataset completo
     X, y = preparar_dados(df)
 
-    # Treinar (não zera)
-    model.fit(X, y, epochs=15, batch_size=16, verbose=0)
+    model.fit(X, y, epochs=20, batch_size=16, verbose=0)
 
-    # Salvar modelo
     model.save(ARQUIVO_MODELO)
 
-    # atualizar estado
     salvar_estado(ultimo_atual)
 
-    return f"Treino concluído. Último concurso treinado: {ultimo_atual}"
+    return f"Treino concluído com {len(X)} exemplos."
 
 def prever_proximo():
-    from tensorflow.keras.models import load_model
-
     df = carregar_historico()
-    dezenas_cols = [str(i) for i in range(74)]
-    bloco = df[dezenas_cols].tail(50).values.reshape(1, 50, 74)
+    dezenas_cols = [f"{i:02d}" for i in range(N_FEATURES)]
+    bloco = df[dezenas_cols].tail(JANELA).values.reshape(1, JANELA, N_FEATURES)
 
     model = load_model(ARQUIVO_MODELO)
     pred = model.predict(bloco)[0]
 
-    return pred  # vetor com 74 probabilidades
+    return pred
 
 def gerar_aposta():
     pred = prever_proximo()
-    top20 = np.argsort(pred)[-20:]     # 20 mais prováveis
-    top20_sorted = sorted(top20)
-    return [int(n) for n in top20_sorted]
+    top20 = np.argsort(pred)[-20:]
+    return sorted([int(n) for n in top20])
 
 def gerar_aposta_espelho():
     pred = prever_proximo()
-    bottom20 = np.argsort(pred)[:20]   # 20 menos prováveis
-    bottom20_sorted = sorted(bottom20)
-    return [int(n) for n in bottom20_sorted]
+    bottom20 = np.argsort(pred)[:20]
+    return sorted([int(n) for n in bottom20])
 
 def gerar_errar_tudo():
-    """Seleciona as 20 piores dezenas possíveis."""
     pred = prever_proximo()
     escolhas = np.argsort(pred)[:20]
-    escolhas_sorted = sorted(escolhas)
-    return [int(n) for n in escolhas_sorted]
+    return sorted([int(n) for n in escolhas])
