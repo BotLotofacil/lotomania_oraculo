@@ -1,3 +1,5 @@
+import json
+import time
 import os
 import csv
 import logging
@@ -16,6 +18,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Arquivo para guardar o último lote gerado (para o /confirmar)
+ULTIMA_GERACAO_PATH = "ultima_geracao_oraculo.json"
+
+# Arquivo de telemetria de desempenho
+DESEMPENHO_PATH = "desempenho_oraculo.csv"
 
 
 # ---------------------------
@@ -322,6 +330,102 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
 
     return [erro1, erro2, erro3]
 
+def gerar_apostas_oraculo_supremo(history: List[Set[int]], model: ModelWrapper):
+    """
+    Oráculo Supremo:
+      1 – Repetição
+      2 – Ciclos
+      3 – Probabilística
+      4 – Híbrida
+      5 – Dezenas quentes
+      6 – Dezenas frias
+    Retorna (apostas, espelhos).
+    """
+    if len(history) < 5:
+        raise ValueError("Histórico insuficiente para Oráculo Supremo (mínimo 5 concursos).")
+
+    # Probabilidades da rede para o PRÓXIMO concurso
+    probs = gerar_probabilidades_para_proximo(history, model)
+    probs = np.clip(probs, 1e-9, None)
+    probs = probs / probs.sum()
+
+    n_hist = len(history)
+    ultimo_concurso = history[-1]  # conjunto de dezenas do último sorteio
+
+    # --------- Frequência (quentes/frias) em janela recente ---------
+    janela = min(200, n_hist)
+    recentes = history[-janela:]
+    freq = np.zeros(100, dtype=np.int32)
+    for conc in recentes:
+        for d in conc:
+            freq[d] += 1
+
+    # --------- Atrasos (ciclos) ---------
+    atrasos = np.zeros(100, dtype=np.int32)
+    for dez in range(100):
+        gap = 0
+        for conc in reversed(history):
+            if dez in conc:
+                break
+            gap += 1
+        atrasos[dez] = gap
+
+    rng = np.random.default_rng()
+
+    # Pequeno ruído para evitar apostas sempre idênticas
+    probs_ruido = probs + rng.normal(0, 0.01, size=probs.shape)
+    probs_ruido = np.clip(probs_ruido, 1e-9, None)
+    probs_ruido = probs_ruido / probs_ruido.sum()
+
+    # --------- APOSTA 1 – REPETIÇÃO ---------
+    candidatos_rep = sorted(list(ultimo_concurso), key=lambda d: probs[d], reverse=True)
+    aposta1 = candidatos_rep[:30]  # até 30 repetidas
+
+    restantes1 = [int(d) for d in np.argsort(-probs) if d not in aposta1]
+    aposta1 += restantes1[:(50 - len(aposta1))]
+    aposta1 = sorted(aposta1)
+
+    # --------- APOSTA 2 – CICLOS ---------
+    score_ciclo = probs * (1.0 + atrasos / (n_hist + 1.0))
+    idx_ciclos = np.argsort(score_ciclo)[-50:]
+    aposta2 = sorted(idx_ciclos.tolist())
+
+    # --------- APOSTA 3 – PROBABILÍSTICA PURA ---------
+    aposta3 = sorted(rng.choice(100, size=50, replace=False, p=probs_ruido).tolist())
+
+    # --------- APOSTA 4 – HÍBRIDA (TOP + MÉDIAS) ---------
+    ordem_pred = np.argsort(probs)
+    top = ordem_pred[-30:]          # mais prováveis
+    medios = ordem_pred[20:80]      # faixa intermediária
+
+    top_list = list(top)
+    pool_medios = [int(d) for d in medios if d not in top_list]
+    qtd_top = 25
+    qtd_medios = 50 - qtd_top
+
+    if len(pool_medios) >= qtd_medios:
+        extra4 = rng.choice(pool_medios, size=qtd_medios, replace=False).tolist()
+    else:
+        extra4 = pool_medios
+
+    aposta4 = sorted(top_list[-qtd_top:] + extra4)
+
+    # --------- APOSTA 5 – DEZENAS QUENTES ---------
+    idx_quentes = np.argsort(freq)[-50:]
+    aposta5 = sorted(idx_quentes.tolist())
+
+    # --------- APOSTA 6 – DEZENAS FRIAS ---------
+    idx_frias = np.argsort(freq)[:50]
+    aposta6 = sorted(idx_frias.tolist())
+
+    apostas = [aposta1, aposta2, aposta3, aposta4, aposta5, aposta6]
+
+    # --------- ESPELHOS: complemento 00–99 ---------
+    universo = set(range(100))
+    espelhos = [sorted(list(universo.difference(set(ap)))) for ap in apostas]
+
+    return apostas, espelhos
+
 
 def format_dezenas_sortidas(dezenas):
     return " ".join(f"{d:02d}" for d in sorted(dezenas))
@@ -340,6 +444,149 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Certifique-se de manter o arquivo lotomania_historico_onehot.csv atualizado."
     )
     await update.message.reply_markdown(msg)
+
+async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /confirmar 00 01 02 ... 99 (20 dezenas)
+    Compara o resultado oficial com as últimas apostas geradas
+    e registra o desempenho.
+    """
+    try:
+        if not os.path.exists(ULTIMA_GERACAO_PATH):
+            await update.message.reply_text(
+                "⚠️ Nenhum lote encontrado. Gere apostas primeiro com /gerar."
+            )
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Envie o comando assim:\n"
+                "/confirmar 00 01 02 ... 19 (20 dezenas do resultado oficial)."
+            )
+            return
+
+        # Parse das 20 dezenas do resultado
+        dezenas_resultado = []
+        for tok in context.args:
+            tok = tok.strip().replace(",", "")
+            if not tok:
+                continue
+            if not tok.isdigit():
+                await update.message.reply_text(f"Valor inválido: {tok}")
+                return
+            v = int(tok)
+            if v < 0 or v > 99:
+                await update.message.reply_text(f"Dezena fora do intervalo 00–99: {v:02d}")
+                return
+            dezenas_resultado.append(v)
+
+        if len(dezenas_resultado) != 20:
+            await update.message.reply_text(
+                f"Você informou {len(dezenas_resultado)} dezenas. "
+                "O resultado da Lotomania deve ter exatamente 20 dezenas."
+            )
+            return
+
+        resultado_set = set(dezenas_resultado)
+
+        # Carrega último lote gerado
+        with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+
+        apostas = dados.get("apostas", [])
+        espelhos = dados.get("espelhos", [])
+        ts = dados.get("timestamp", time.time())
+
+        labels = [
+            "Aposta 1 – Repetição",
+            "Aposta 2 – Ciclos",
+            "Aposta 3 – Probabilística",
+            "Aposta 4 – Híbrida",
+            "Aposta 5 – Dezenas quentes",
+            "Aposta 6 – Dezenas frias",
+        ]
+
+        def contar_acertos(lista):
+            return len(set(lista) & resultado_set)
+
+        linhas = [
+            "✅ *Confirmação de resultado (Oráculo Lotomania)*",
+            "",
+            "Resultado informado:",
+            " ".join(f"{d:02d}" for d in sorted(resultado_set)),
+            "",
+        ]
+
+        # Telemetria em memória
+        registro = {
+            "timestamp": ts,
+            "resultado": sorted(resultado_set),
+            "apostas": [],
+        }
+
+        melhor_acertos = -1
+        melhor_label = ""
+
+        for i, (ap, esp) in enumerate(zip(apostas, espelhos), start=1):
+            acertos_ap = contar_acertos(ap)
+            acertos_esp = contar_acertos(esp)
+
+            if acertos_ap > melhor_acertos:
+                melhor_acertos = acertos_ap
+                melhor_label = f"{labels[i-1]} (principal)"
+
+            if acertos_esp > melhor_acertos:
+                melhor_acertos = acertos_esp
+                melhor_label = f"{labels[i-1]} (espelho)"
+
+            linhas.append(f"*{labels[i-1]}*")
+            linhas.append(f"Principal: {acertos_ap} acertos")
+            linhas.append(f"Espelho:   {acertos_esp} acertos")
+            linhas.append("")
+
+            registro["apostas"].append(
+                {
+                    "tipo": labels[i-1],
+                    "acertos_principal": int(acertos_ap),
+                    "acertos_espelho": int(acertos_esp),
+                }
+            )
+
+        linhas.append(f"🏆 Melhor desempenho: *{melhor_label}* com {melhor_acertos} acertos.")
+
+        # Grava telemetria em CSV simples
+        try:
+            cabecalho = not os.path.exists(DESEMPENHO_PATH)
+            import csv
+
+            with open(DESEMPENHO_PATH, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f, delimiter=";")
+                if cabecalho:
+                    writer.writerow([
+                        "timestamp",
+                        "resultado",
+                        "ap1_principal", "ap1_espelho",
+                        "ap2_principal", "ap2_espelho",
+                        "ap3_principal", "ap3_espelho",
+                        "ap4_principal", "ap4_espelho",
+                        "ap5_principal", "ap5_espelho",
+                        "ap6_principal", "ap6_espelho",
+                    ])
+
+                row = [ts, " ".join(f"{d:02d}" for d in sorted(resultado_set))]
+                for reg in registro["apostas"]:
+                    row.append(reg["acertos_principal"])
+                    row.append(reg["acertos_espelho"])
+                writer.writerow(row)
+
+        except Exception as e_csv:
+            logger.exception(f"Erro ao gravar telemetria: {e_csv}")
+
+        await update.message.reply_markdown("\n".join(linhas))
+
+    except Exception as e:
+        logger.exception("Erro no /confirmar")
+        await update.message.reply_text(f"❌ Erro no /confirmar: {e}")
 
 
 async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -375,19 +622,48 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = load_history(HISTORY_PATH)
         model = load_model_local()
 
-        apostas, espelhos = gerar_apostas_e_espelhos(history, model)
+        # Usa o Oráculo Supremo
+        apostas, espelhos = gerar_apostas_oraculo_supremo(history, model)
 
-        linhas = ["🔮 *Apostas sugeridas (Lotomania)*\n"]
-        for i, ap in enumerate(apostas, start=1):
-            linhas.append(f"*Aposta {i}:*  {format_dezenas_sortidas(ap)}")
-            linhas.append(f"Espelho {i}: {format_dezenas_sortidas(espelhos[i-1])}")
+        # Salva o último lote para uso no /confirmar
+        try:
+            dados = {
+                "timestamp": time.time(),
+                "apostas": apostas,
+                "espelhos": espelhos,
+            }
+            with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
+                json.dump(dados, f)
+        except Exception as e_save:
+            logger.exception(f"Não foi possível salvar última geração: {e_save}")
+
+        labels = [
+            "Aposta 1 – Repetição",
+            "Aposta 2 – Ciclos",
+            "Aposta 3 – Probabilística",
+            "Aposta 4 – Híbrida",
+            "Aposta 5 – Dezenas quentes",
+            "Aposta 6 – Dezenas frias",
+        ]
+
+        def fmt(lista):
+            return " ".join(f"{d:02d}" for d in sorted(lista))
+
+        linhas = ["🔮 *Oráculo Supremo – Apostas (Lotomania)*", ""]
+
+        for i, (ap, esp) in enumerate(zip(apostas, espelhos), start=1):
+            linhas.append(f"*{labels[i-1]}*")
+            linhas.append(fmt(ap))
+            linhas.append(f"_Espelho {i}_")
+            linhas.append(fmt(esp))
             linhas.append("")
 
-        await update.message.reply_markdown("\n".join(linhas))
+        texto = "\n".join(linhas).strip()
+        await update.message.reply_markdown(texto)
 
     except Exception as e:
-        logger.exception("Erro ao gerar apostas")
-        await update.message.reply_text(f"❌ Erro ao gerar apostas: {e}")
+        logger.exception("Erro ao gerar apostas (Oráculo Supremo)")
+        await update.message.reply_text(f"⚠️ Erro ao gerar apostas: {e}")
 
 
 async def errar_tudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,6 +695,7 @@ def main():
     app.add_handler(CommandHandler("treinar", treinar_cmd))
     app.add_handler(CommandHandler("gerar", gerar_cmd))
     app.add_handler(CommandHandler("errar_tudo", errar_tudo_cmd))
+    app.add_handler(CommandHandler("confirmar", confirmar_cmd))
 
     logger.info("Bot Lotomania iniciado.")
     app.run_polling()
