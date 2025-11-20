@@ -437,13 +437,14 @@ def format_dezenas_sortidas(dezenas):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🔮 *Oráculo Lotomania*\n\n"
+        "🔮 Oráculo Lotomania\n\n"
         "/treinar - treina ou atualiza a rede neural\n"
-        "/gerar - gera 3 apostas + 3 espelhos\n"
-        "/errar_tudo - gera 3 apostas tentando errar tudo\n\n"
-        "Certifique-se de manter o arquivo lotomania_historico_onehot.csv atualizado."
+        "/gerar - Oráculo Supremo (6 apostas + 6 espelhos)\n"
+        "/errar_tudo - gera 3 apostas tentando errar tudo\n"
+        "/confirmar - confronta o resultado oficial com o último bloco gerado\n\n"
+        "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado."
     )
-    await update.message.reply_markdown(msg)
+    await update.message.reply_text(msg)
 
 async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
