@@ -13,6 +13,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 HISTORY_PATH = "lotomania_historico_onehot.csv"
 MODEL_PATH = "lotomania_model.npz"
 
+ULTIMA_GERACAO_PATH = "lotomania_ultima_geracao.json"
+DESEMPENHO_PATH = "lotomania_desempenho.csv"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -330,6 +333,53 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
 
     return [erro1, erro2, erro3]
 
+def treino_incremental_pos_concurso(history: List[Set[int]], resultado_set: set[int]):
+    """
+    Treino incremental leve:
+    - usa o ÚLTIMO ponto da linha do tempo do histórico
+    - calcula features de cada dezena (00–99)
+    - faz um passo de treino com o resultado confirmado
+    """
+    try:
+        wrapper = load_model_local()
+    except FileNotFoundError:
+        # ainda não existe modelo → nada a fazer
+        logger.warning("Treino incremental ignorado: modelo ainda não treinado (/treinar).")
+        return
+    except Exception as e:
+        logger.exception(f"Erro ao carregar modelo para treino incremental: {e}")
+        return
+
+    if len(history) < 2:
+        logger.warning("Histórico insuficiente para treino incremental.")
+        return
+
+    idx = len(history) - 1  # último concurso do histórico
+    X_list = []
+    y_list = []
+
+    for dezena in range(100):
+        feats = compute_features_for_dozen(history, idx, dezena)
+        X_list.append(feats)
+        y_list.append(1 if dezena in resultado_set else 0)
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.float32)
+
+    # usa o mesmo scaler original
+    X_scaled = (X - wrapper.mean_) / wrapper.std_
+
+    # passo rápido de ajuste
+    wrapper.mlp.fit(X_scaled, y, epochs=15, batch_size=100)
+
+    # salva e atualiza cache
+    save_model(wrapper)
+    global _model_cache
+    _model_cache = wrapper
+
+    logger.info("Treino incremental pós-concurso concluído.")
+
+
 def gerar_apostas_oraculo_supremo(history: List[Set[int]], model: ModelWrapper):
     """
     Oráculo Supremo:
@@ -445,166 +495,178 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado."
     )
     await update.message.reply_text(msg)
+    
 
 async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /confirmar 00 01 02 ... 99 (20 dezenas)
-    Compara o resultado oficial com as últimas apostas geradas
-    e registra o desempenho.
+    /confirmar 02 08 15 20 24 25 30 34 37 40 43 51 60 62 67 77 81 85 87 94
+
+    1) Lê a última geração salva pelo /gerar
+    2) Compara o resultado com as 6 apostas + 6 espelhos
+    3) Salva histórico de acertos em CSV
+    4) Dispara treino incremental da rede neural
     """
+    texto = (update.message.text or "").strip()
+    partes = texto.split()
+
+    if len(partes) < 21:
+        await update.message.reply_text(
+            "❌ Uso correto:\n"
+            "/confirmar 02 08 15 20 24 25 30 34 37 40 43 51 60 62 67 77 81 85 87 94"
+        )
+        return
+
+    # ----------------------------------
+    # 1) Parse do resultado oficial
+    # ----------------------------------
     try:
-        # 1) Verifica se existe o arquivo de última geração
-        if not os.path.exists(ULTIMA_GERACAO_PATH):
+        dezenas_str = partes[1:]
+        dezenas_int = [int(d) for d in dezenas_str]
+
+        # filtra duplicadas e valida faixa
+        resultado = []
+        for d in dezenas_int:
+            if 0 <= d <= 99 and d not in resultado:
+                resultado.append(d)
+
+        if len(resultado) != 20:
             await update.message.reply_text(
-                "⚠️ Nenhum lote encontrado.\n"
-                "Use primeiro o comando /gerar e depois /confirmar."
+                f"❌ Informe exatamente 20 dezenas válidas (00–99). Recebi {len(resultado)}."
             )
             return
 
-        if not context.args:
-            await update.message.reply_text(
-                "Envie o comando assim:\n"
-                "/confirmar 00 01 02 ... 19\n"
-                "(as 20 dezenas do resultado oficial da Lotomania)."
-            )
-            return
+        resultado_set = set(resultado)
 
-        # 2) Lê e valida o JSON da última geração
-        try:
-            with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
-                conteudo = f.read().strip()
+    except ValueError:
+        await update.message.reply_text("❌ Não consegui interpretar as dezenas. Use apenas números separados por espaço.")
+        return
 
-            if not conteudo:
-                # arquivo existe, mas está vazio
-                await update.message.reply_text(
-                    "⚠️ Arquivo de última geração está vazio.\n"
-                    "Use /gerar novamente para criar um novo bloco de apostas "
-                    "e depois execute /confirmar."
-                )
-                return
+    # ----------------------------------
+    # 2) Carrega última geração
+    # ----------------------------------
+    if not os.path.exists(ULTIMA_GERACAO_PATH):
+        await update.message.reply_text(
+            "⚠️ Arquivo de última geração não encontrado.\n"
+            "Gere um novo bloco com /gerar e depois use /confirmar."
+        )
+        return
 
-            dados = json.loads(conteudo)
+    try:
+        with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
+            dados = json.load(f)
 
-        except json.JSONDecodeError:
-            await update.message.reply_text(
-                "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
-                "Use /gerar novamente para gerar um novo bloco de apostas "
-                "e depois execute /confirmar."
-            )
-            return
-
-        # 3) Parse das 20 dezenas do resultado informado
-        dezenas_resultado = []
-        for tok in context.args:
-            tok = tok.strip().replace(",", "")
-            if not tok:
-                continue
-            if not tok.isdigit():
-                await update.message.reply_text(f"Valor inválido: {tok}")
-                return
-            v = int(tok)
-            if v < 0 or v > 99:
-                await update.message.reply_text(f"Dezena fora do intervalo 00–99: {v:02d}")
-                return
-            dezenas_resultado.append(v)
-
-        if len(dezenas_resultado) != 20:
-            await update.message.reply_text(
-                f"Você informou {len(dezenas_resultado)} dezenas.\n"
-                "O resultado da Lotomania deve ter exatamente 20 dezenas."
-            )
-            return
-
-        resultado_set = set(dezenas_resultado)
-
-        apostas = dados.get("apostas", [])
-        espelhos = dados.get("espelhos", [])
-        ts = dados.get("timestamp", time.time())
+        apostas = dados.get("apostas")
+        espelhos = dados.get("espelhos")
 
         if not apostas or not espelhos:
-            await update.message.reply_text(
-                "⚠️ Não encontrei apostas válidas no arquivo de última geração.\n"
-                "Use /gerar novamente e depois /confirmar."
-            )
-            return
+            raise ValueError("Dados incompletos na última geração.")
 
-        labels = [
-            "Aposta 1 – Repetição",
-            "Aposta 2 – Ciclos",
-            "Aposta 3 – Probabilística",
-            "Aposta 4 – Híbrida",
-            "Aposta 5 – Dezenas quentes",
-            "Aposta 6 – Dezenas frias",
-        ]
-
-        def contar_acertos(lista):
-            return len(set(lista) & resultado_set)
-
-        linhas = [
-            "✅ Confirmação de resultado (Oráculo Lotomania)",
-            "",
-            "Resultado informado:",
-            " ".join(f"{d:02d}" for d in sorted(resultado_set)),
-            "",
-        ]
-
-        melhor_acertos = -1
-        melhor_label = ""
-
-        registro_csv = []  # para escrever no desempenho_oraculo.csv
-
-        for i, (ap, esp) in enumerate(zip(apostas, espelhos), start=1):
-            acertos_ap = contar_acertos(ap)
-            acertos_esp = contar_acertos(esp)
-
-            if acertos_ap > melhor_acertos:
-                melhor_acertos = acertos_ap
-                melhor_label = f"{labels[i-1]} (principal)"
-
-            if acertos_esp > melhor_acertos:
-                melhor_acertos = acertos_esp
-                melhor_label = f"{labels[i-1]} (espelho)"
-
-            linhas.append(f"{labels[i-1]}")
-            linhas.append(f"Principal: {acertos_ap} acertos")
-            linhas.append(f"Espelho:   {acertos_esp} acertos")
-            linhas.append("")
-
-            registro_csv.extend([acertos_ap, acertos_esp])
-
-        linhas.append(f"🏆 Melhor desempenho: {melhor_label} com {melhor_acertos} acertos.")
-
-        # 4) Grava telemetria simples em CSV
-        try:
-            cabecalho = not os.path.exists(DESEMPENHO_PATH)
-            import csv
-
-            with open(DESEMPENHO_PATH, "a", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f, delimiter=";")
-                if cabecalho:
-                    writer.writerow([
-                        "timestamp",
-                        "resultado",
-                        "ap1_principal", "ap1_espelho",
-                        "ap2_principal", "ap2_espelho",
-                        "ap3_principal", "ap3_espelho",
-                        "ap4_principal", "ap4_espelho",
-                        "ap5_principal", "ap5_espelho",
-                        "ap6_principal", "ap6_espelho",
-                    ])
-
-                row = [ts, " ".join(f"{d:02d}" for d in sorted(resultado_set))]
-                row.extend(registro_csv)
-                writer.writerow(row)
-
-        except Exception as e_csv:
-            logger.exception(f"Erro ao gravar telemetria: {e_csv}")
-
-        await update.message.reply_text("\n".join(linhas))
+        # garante int nativo
+        apostas_py = [[int(x) for x in ap] for ap in apostas]
+        espelhos_py = [[int(x) for x in esp] for esp in espelhos]
 
     except Exception as e:
-        logger.exception("Erro no /confirmar")
-        await update.message.reply_text(f"❌ Erro no /confirmar: {e}")
+        logger.exception("Erro ao ler arquivo de última geração.")
+        await update.message.reply_text(
+            "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
+            "Use /gerar novamente para criar um novo bloco de apostas e depois /confirmar."
+        )
+        return
+
+    # ----------------------------------
+    # 3) Calcula acertos por aposta/espelho
+    # ----------------------------------
+    hits_apostas = []
+    hits_espelhos = []
+
+    for ap, esp in zip(apostas_py, espelhos_py):
+        hits_apostas.append(len(resultado_set.intersection(ap)))
+        hits_espelhos.append(len(resultado_set.intersection(esp)))
+
+    melhor_ap_idx = int(np.argmax(hits_apostas))  # 0–5
+    melhor_esp_idx = int(np.argmax(hits_espelhos))
+
+    # ----------------------------------
+    # 4) Salva histórico de acertos em CSV
+    # ----------------------------------
+    try:
+        existe = os.path.exists(DESEMPENHO_PATH)
+        with open(DESEMPENHO_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=";")
+
+            if not existe:
+                header = [
+                    "timestamp",
+                    "resultado",
+                    "acertos_ap1", "acertos_ap2", "acertos_ap3",
+                    "acertos_ap4", "acertos_ap5", "acertos_ap6",
+                    "acertos_esp1", "acertos_esp2", "acertos_esp3",
+                    "acertos_esp4", "acertos_esp5", "acertos_esp6",
+                    "melhor_aposta", "melhor_espelho",
+                ]
+                writer.writerow(header)
+
+            ts = time.time()
+            resultado_txt = " ".join(f"{d:02d}" for d in sorted(resultado))
+
+            row = [
+                f"{ts:.3f}",
+                resultado_txt,
+                *[int(h) for h in hits_apostas],
+                *[int(h) for h in hits_espelhos],
+                melhor_ap_idx + 1,
+                melhor_esp_idx + 1,
+            ]
+            writer.writerow(row)
+
+        logger.info("Desempenho registrado em %s", DESEMPENHO_PATH)
+
+    except Exception as e_csv:
+        logger.exception("Erro ao salvar desempenho em CSV: %s", e_csv)
+
+    # ----------------------------------
+    # 5) Treino incremental da rede neural
+    # ----------------------------------
+    try:
+        history = load_history(HISTORY_PATH)
+        treino_incremental_pos_concurso(history, resultado_set)
+        txt_treino = "\n🧠 Treino incremental aplicado ao modelo."
+    except Exception as e_inc:
+        logger.exception("Erro no treino incremental pós-concurso: %s", e_inc)
+        txt_treino = "\n⚠️ Não foi possível aplicar o treino incremental (ver logs)."
+
+    # ----------------------------------
+    # 6) Resposta para o usuário
+    # ----------------------------------
+    linhas = []
+    linhas.append("✅ Resultado confirmado!")
+    linhas.append("Dezenas sorteadas:")
+    linhas.append(" ".join(f"{d:02d}" for d in sorted(resultado)))
+    linhas.append("")
+
+    labels = [
+        "Aposta 1 – Repetição",
+        "Aposta 2 – Ciclos",
+        "Aposta 3 – Probabilística",
+        "Aposta 4 – Híbrida",
+        "Aposta 5 – Dezenas quentes",
+        "Aposta 6 – Dezenas frias",
+    ]
+
+    for i in range(6):
+        linhas.append(f"{labels[i]}: {hits_apostas[i]} acertos")
+        linhas.append(f"Espelho {i+1}: {hits_espelhos[i]} acertos")
+        linhas.append("")
+
+    linhas.append(
+        f"🏅 Melhor aposta: {labels[melhor_ap_idx]} ({hits_apostas[melhor_ap_idx]} pontos)"
+    )
+    linhas.append(
+        f"🏅 Melhor espelho: Espelho {melhor_esp_idx+1} ({hits_espelhos[melhor_esp_idx]} pontos)"
+    )
+    linhas.append(txt_treino)
+
+    await update.message.reply_text("\n".join(linhas).strip())
 
 
 async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
