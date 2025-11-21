@@ -382,97 +382,101 @@ def treino_incremental_pos_concurso(history: List[Set[int]], resultado_set: set[
 
 def gerar_apostas_oraculo_supremo(history: List[Set[int]], model: ModelWrapper):
     """
-    Oráculo Supremo:
+    Oráculo Supremo – 6 apostas totalmente independentes:
+
       1 – Repetição
       2 – Ciclos
-      3 – Probabilística
-      4 – Híbrida
-      5 – Dezenas quentes
-      6 – Dezenas frias
-    Retorna (apostas, espelhos).
+      3 – Probabilística real
+      4 – Híbrida (prob + ciclos)
+      5 – Quentes
+      6 – Frias
     """
-    if len(history) < 5:
-        raise ValueError("Histórico insuficiente para Oráculo Supremo (mínimo 5 concursos).")
 
-    # Probabilidades da rede para o PRÓXIMO concurso
+    if len(history) < 5:
+        raise ValueError("Histórico insuficiente para Oráculo Supremo.")
+
+    # ====================================================
+    #   PROBABILIDADES DA REDE – NORMALIZADAS
+    # ====================================================
     probs = gerar_probabilidades_para_proximo(history, model)
     probs = np.clip(probs, 1e-9, None)
     probs = probs / probs.sum()
 
-    n_hist = len(history)
-    ultimo_concurso = history[-1]  # conjunto de dezenas do último sorteio
-
-    # --------- Frequência (quentes/frias) em janela recente ---------
-    janela = min(200, n_hist)
-    recentes = history[-janela:]
+    # ====================================================
+    #   FREQUÊNCIAS (QUENTES) E ATRASOS (FRIAS)
+    # ====================================================
+    janela = min(200, len(history))
     freq = np.zeros(100, dtype=np.int32)
-    for conc in recentes:
+
+    for conc in history[-janela:]:
         for d in conc:
             freq[d] += 1
 
-    # --------- Atrasos (ciclos) ---------
     atrasos = np.zeros(100, dtype=np.int32)
-    for dez in range(100):
+    for d in range(100):
         gap = 0
         for conc in reversed(history):
-            if dez in conc:
+            if d in conc:
                 break
             gap += 1
-        atrasos[dez] = gap
+        atrasos[d] = gap
 
+    # ====================================================
+    #   RUÍDO ADAPTATIVO – muda A CADA EXECUÇÃO
+    # ====================================================
     rng = np.random.default_rng()
-
-    # Pequeno ruído para evitar apostas sempre idênticas
-    probs_ruido = probs + rng.normal(0, 0.01, size=probs.shape)
+    ruido = rng.normal(0, 0.05, size=probs.shape)  # antes era 0.01 !
+    probs_ruido = probs + ruido
     probs_ruido = np.clip(probs_ruido, 1e-9, None)
     probs_ruido = probs_ruido / probs_ruido.sum()
 
-    # --------- APOSTA 1 – REPETIÇÃO ---------
-    candidatos_rep = sorted(list(ultimo_concurso), key=lambda d: probs[d], reverse=True)
-    aposta1 = candidatos_rep[:30]  # até 30 repetidas
+    # ====================================================
+    #   APOSTA 1 – REPETIÇÃO
+    # ====================================================
+    ultimo = history[-1]
+    cand_rep = sorted(list(ultimo), key=lambda d: probs[d], reverse=True)
 
-    restantes1 = [int(d) for d in np.argsort(-probs) if d not in aposta1]
-    aposta1 += restantes1[:(50 - len(aposta1))]
+    aposta1 = cand_rep[:20]  # 20 repetidas
+    restantes = [int(d) for d in np.argsort(-probs) if d not in aposta1]
+    aposta1 += restantes[:30]  # completar 50
     aposta1 = sorted(aposta1)
 
-    # --------- APOSTA 2 – CICLOS ---------
-    score_ciclo = probs * (1.0 + atrasos / (n_hist + 1.0))
-    idx_ciclos = np.argsort(score_ciclo)[-50:]
-    aposta2 = sorted(idx_ciclos.tolist())
+    # ====================================================
+    #   APOSTA 2 – CICLOS (rank não-linear)
+    # ====================================================
+    score_ciclo = probs ** 0.6 * (1 + atrasos / max(atrasos))
+    idx_ciclo = np.argsort(score_ciclo)[-50:]
+    aposta2 = sorted(idx_ciclo.tolist())
 
-    # --------- APOSTA 3 – PROBABILÍSTICA PURA ---------
-    aposta3 = sorted(rng.choice(100, size=50, replace=False, p=probs_ruido).tolist())
+    # ====================================================
+    #   APOSTA 3 – PROBABILÍSTICA REAL
+    # ====================================================
+    aposta3 = sorted(rng.choice(100, size=50, replace=False, p=probs_ruido))
 
-    # --------- APOSTA 4 – HÍBRIDA (TOP + MÉDIAS) ---------
-    ordem_pred = np.argsort(probs)
-    top = ordem_pred[-30:]          # mais prováveis
-    medios = ordem_pred[20:80]      # faixa intermediária
+    # ====================================================
+    #   APOSTA 4 – HÍBRIDA (50% probabilidade + 50% ciclos)
+    # ====================================================
+    score_hibrido = (probs ** 0.5) * (1 + atrasos ** 0.4)
+    idx_hib = np.argsort(score_hibrido)[-50:]
+    aposta4 = sorted(idx_hib.tolist())
 
-    top_list = list(top)
-    pool_medios = [int(d) for d in medios if d not in top_list]
-    qtd_top = 25
-    qtd_medios = 50 - qtd_top
+    # ====================================================
+    #   APOSTA 5 – QUENTES (freq)
+    # ====================================================
+    aposta5 = sorted(np.argsort(freq)[-50:].tolist())
 
-    if len(pool_medios) >= qtd_medios:
-        extra4 = rng.choice(pool_medios, size=qtd_medios, replace=False).tolist()
-    else:
-        extra4 = pool_medios
+    # ====================================================
+    #   APOSTA 6 – FRIAS (freq baixa + atraso alto)
+    # ====================================================
+    score_frio = freq * 0.2 + atrasos * 0.8
+    aposta6 = sorted(np.argsort(score_frio)[:50].tolist())
 
-    aposta4 = sorted(top_list[-qtd_top:] + extra4)
-
-    # --------- APOSTA 5 – DEZENAS QUENTES ---------
-    idx_quentes = np.argsort(freq)[-50:]
-    aposta5 = sorted(idx_quentes.tolist())
-
-    # --------- APOSTA 6 – DEZENAS FRIAS ---------
-    idx_frias = np.argsort(freq)[:50]
-    aposta6 = sorted(idx_frias.tolist())
-
-    apostas = [aposta1, aposta2, aposta3, aposta4, aposta5, aposta6]
-
-    # --------- ESPELHOS: complemento 00–99 ---------
+    # ====================================================
+    #   ESPELHOS
+    # ====================================================
     universo = set(range(100))
-    espelhos = [sorted(list(universo.difference(set(ap)))) for ap in apostas]
+    apostas = [aposta1, aposta2, aposta3, aposta4, aposta5, aposta6]
+    espelhos = [sorted(universo - set(ap)) for ap in apostas]
 
     return apostas, espelhos
 
@@ -495,7 +499,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado."
     )
     await update.message.reply_text(msg)
-    
+
 
 async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
