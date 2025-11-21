@@ -643,17 +643,23 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Usa o Oráculo Supremo
         apostas, espelhos = gerar_apostas_oraculo_supremo(history, model)
 
-        # Salva o último lote para uso no /confirmar
+        # CONVERSÃO: transforma tudo em int nativo do Python
+        apostas_py = [[int(x) for x in ap] for ap in apostas]
+        espelhos_py = [[int(x) for x in esp] for esp in espelhos]
+
+        # Salva última geração para o /confirmar
         try:
             dados = {
-                "timestamp": time.time(),
-                "apostas": apostas,
-                "espelhos": espelhos,
+                "timestamp": float(time.time()),
+                "apostas": apostas_py,
+                "espelhos": espelhos_py,
             }
+
             with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
-                json.dump(dados, f)
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+
         except Exception as e_save:
-            logger.exception(f"Não foi possível salvar última geração: {e_save}")
+            logger.exception(f"Erro ao salvar última geração: {e_save}")
 
         labels = [
             "Aposta 1 – Repetição",
@@ -667,17 +673,17 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         def fmt(lista):
             return " ".join(f"{d:02d}" for d in sorted(lista))
 
-        linhas = ["🔮 *Oráculo Supremo – Apostas (Lotomania)*", ""]
+        linhas = ["🔮 Oráculo Supremo – Apostas (Lotomania)\n"]
 
-        for i, (ap, esp) in enumerate(zip(apostas, espelhos), start=1):
-            linhas.append(f"*{labels[i-1]}*")
+        for i, (ap, esp) in enumerate(zip(apostas_py, espelhos_py), start=1):
+            linhas.append(f"{labels[i-1]}:")
             linhas.append(fmt(ap))
-            linhas.append(f"_Espelho {i}_")
+            linhas.append(f"Espelho {i}:")
             linhas.append(fmt(esp))
             linhas.append("")
 
         texto = "\n".join(linhas).strip()
-        await update.message.reply_markdown(texto)
+        await update.message.reply_text(texto)
 
     except Exception as e:
         logger.exception("Erro ao gerar apostas (Oráculo Supremo)")
