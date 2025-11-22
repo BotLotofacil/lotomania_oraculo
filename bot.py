@@ -509,8 +509,8 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /confirmar 02 08 15 20 24 25 30 34 37 40 43 51 60 62 67 77 81 85 87 94
 
-    1) Lê a última geração salva pelo /gerar
-    2) Compara o resultado com as 6 apostas + 6 espelhos
+    1) Lê a última geração salva pelo /gerar ou /errar_tudo
+    2) Compara o resultado com as apostas + espelhos
     3) Salva histórico de acertos em CSV
     4) Dispara treino incremental da rede neural
     """
@@ -555,7 +555,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(ULTIMA_GERACAO_PATH):
         await update.message.reply_text(
             "⚠️ Arquivo de última geração não encontrado.\n"
-            "Gere um novo bloco com /gerar e depois use /confirmar."
+            "Gere um novo bloco com /gerar ou /errar_tudo e depois use /confirmar."
         )
         return
 
@@ -565,6 +565,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         apostas = dados.get("apostas")
         espelhos = dados.get("espelhos")
+        modo = dados.get("modo", "oraculo")  # "oraculo" ou "errar_tudo"
 
         if not apostas or not espelhos:
             raise ValueError("Dados incompletos na última geração.")
@@ -591,11 +592,19 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hits_apostas.append(len(resultado_set.intersection(ap)))
         hits_espelhos.append(len(resultado_set.intersection(esp)))
 
-    melhor_ap_idx = int(np.argmax(hits_apostas))  # 0–5
+    n_apostas = len(hits_apostas)
+    n_esp = len(hits_espelhos)
+
+    if n_apostas == 0:
+        await update.message.reply_text("⚠️ Não há apostas válidas na última geração.")
+        return
+
+    melhor_ap_idx = int(np.argmax(hits_apostas))  # 0..n-1
     melhor_esp_idx = int(np.argmax(hits_espelhos))
 
     # ----------------------------------
     # 4) Salva histórico de acertos em CSV
+    #     (mantendo compatibilidade com 6 apostas/espelhos)
     # ----------------------------------
     try:
         existe = os.path.exists(DESEMPENHO_PATH)
@@ -611,19 +620,25 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "acertos_esp1", "acertos_esp2", "acertos_esp3",
                     "acertos_esp4", "acertos_esp5", "acertos_esp6",
                     "melhor_aposta", "melhor_espelho",
+                    "modo",
                 ]
                 writer.writerow(header)
 
             ts = time.time()
             resultado_txt = " ".join(f"{d:02d}" for d in sorted(resultado))
 
+            # Padding para sempre ter 6 posições
+            ha = (hits_apostas + [0] * 6)[:6]
+            he = (hits_espelhos + [0] * 6)[:6]
+
             row = [
                 f"{ts:.3f}",
                 resultado_txt,
-                *[int(h) for h in hits_apostas],
-                *[int(h) for h in hits_espelhos],
+                *[int(h) for h in ha],
+                *[int(h) for h in he],
                 melhor_ap_idx + 1,
                 melhor_esp_idx + 1,
+                modo,
             ]
             writer.writerow(row)
 
@@ -652,26 +667,39 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     linhas.append(" ".join(f"{d:02d}" for d in sorted(resultado)))
     linhas.append("")
 
-    labels = [
-        "Aposta 1 – Repetição",
-        "Aposta 2 – Ciclos",
-        "Aposta 3 – Probabilística",
-        "Aposta 4 – Híbrida",
-        "Aposta 5 – Dezenas quentes",
-        "Aposta 6 – Dezenas frias",
-    ]
+    if modo == "errar_tudo":
+        labels = [f"Aposta erro {i}" for i in range(1, n_apostas + 1)]
+    else:
+        labels = [
+            "Aposta 1 – Repetição",
+            "Aposta 2 – Ciclos",
+            "Aposta 3 – Probabilística",
+            "Aposta 4 – Híbrida",
+            "Aposta 5 – Dezenas quentes",
+            "Aposta 6 – Dezenas frias",
+        ]
+        labels = labels[:n_apostas]
 
-    for i in range(6):
+    for i in range(n_apostas):
         linhas.append(f"{labels[i]}: {hits_apostas[i]} acertos")
         linhas.append(f"Espelho {i+1}: {hits_espelhos[i]} acertos")
         linhas.append("")
 
-    linhas.append(
-        f"🏅 Melhor aposta: {labels[melhor_ap_idx]} ({hits_apostas[melhor_ap_idx]} pontos)"
-    )
-    linhas.append(
-        f"🏅 Melhor espelho: Espelho {melhor_esp_idx+1} ({hits_espelhos[melhor_esp_idx]} pontos)"
-    )
+    if modo == "errar_tudo":
+        linhas.append(
+            f"🏅 Melhor aposta erro: Aposta erro {melhor_ap_idx+1} ({hits_apostas[melhor_ap_idx]} pontos)"
+        )
+        linhas.append(
+            f"🏅 Melhor espelho erro: Espelho erro {melhor_esp_idx+1} ({hits_espelhos[melhor_esp_idx]} pontos)"
+        )
+    else:
+        linhas.append(
+            f"🏅 Melhor aposta: {labels[melhor_ap_idx]} ({hits_apostas[melhor_ap_idx]} pontos)"
+        )
+        linhas.append(
+            f"🏅 Melhor espelho: Espelho {melhor_esp_idx+1} ({hits_espelhos[melhor_esp_idx]} pontos)"
+        )
+
     linhas.append(txt_treino)
 
     await update.message.reply_text("\n".join(linhas).strip())
@@ -721,6 +749,7 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             dados = {
                 "timestamp": float(time.time()),
+                "modo": "oraculo",
                 "apostas": apostas_py,
                 "espelhos": espelhos_py,
             }
@@ -767,11 +796,32 @@ async def errar_tudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         apostas_erro = gerar_apostas_errar_tudo(history, model)
 
-        linhas = ["🙃 *Apostas para tentar errar tudo*\n"]
-        for i, ap in enumerate(apostas_erro, start=1):
+        # Cria espelhos também para errar_tudo
+        universo = set(range(100))
+        espelhos_erro = [sorted(list(universo - set(ap))) for ap in apostas_erro]
+
+        # CONVERTE para int nativo
+        apostas_py = [[int(x) for x in ap] for ap in apostas_erro]
+        espelhos_py = [[int(x) for x in esp] for esp in espelhos_erro]
+
+        # Salva como "modo = errar_tudo" para o /confirmar
+        try:
+            dados = {
+                "timestamp": float(time.time()),
+                "modo": "errar_tudo",
+                "apostas": apostas_py,
+                "espelhos": espelhos_py,
+            }
+            with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+        except Exception as e_save:
+            logger.exception(f"Erro ao salvar última geração (errar_tudo): {e_save}")
+
+        linhas = ["🙃 Apostas para tentar errar tudo\n"]
+        for i, ap in enumerate(apostas_py, start=1):
             linhas.append(f"Aposta erro {i}: {format_dezenas_sortidas(ap)}")
 
-        await update.message.reply_markdown("\n".join(linhas))
+        await update.message.reply_text("\n".join(linhas))
 
     except Exception as e:
         logger.exception("Erro ao gerar apostas de erro")
