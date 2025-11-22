@@ -1,3 +1,5 @@
+# ORACULO.py – Oráculo Lotomania com aprendizado incremental
+
 import json
 import time
 import os
@@ -9,18 +11,11 @@ import numpy as np
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Caminho do histórico e do modelo
-HISTORY_PATH = "lotomania_historico_onehot.csv"
-MODEL_PATH = "lotomania_model.npz"
-
-ULTIMA_GERACAO_PATH = "lotomania_ultima_geracao.json"
-DESEMPENHO_PATH = "lotomania_desempenho.csv"
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# ----------------------------------------------------
+# Caminhos de arquivos principais
+# ----------------------------------------------------
+HISTORY_PATH = "lotomania_historico_onehot.csv"   # histórico one-hot (00–99)
+MODEL_PATH = "lotomania_model.npz"                # pesos da rede neural
 
 # Arquivo para guardar o último lote gerado (para o /confirmar)
 ULTIMA_GERACAO_PATH = "ultima_geracao_oraculo.json"
@@ -28,10 +23,15 @@ ULTIMA_GERACAO_PATH = "ultima_geracao_oraculo.json"
 # Arquivo de telemetria de desempenho
 DESEMPENHO_PATH = "desempenho_oraculo.csv"
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# ---------------------------
+# ----------------------------------------------------
 # REDE NEURAL SIMPLES (MLP)
-# ---------------------------
+# ----------------------------------------------------
 
 class SimpleMLP:
     """
@@ -124,9 +124,9 @@ class ModelWrapper:
 _model_cache: ModelWrapper | None = None  # cache na memória
 
 
-# ---------------------------
+# ----------------------------------------------------
 # LEITURA DO HISTÓRICO
-# ---------------------------
+# ----------------------------------------------------
 
 def load_history(path: str) -> List[Set[int]]:
     """
@@ -164,9 +164,9 @@ def load_history(path: str) -> List[Set[int]]:
     return history
 
 
-# ---------------------------
+# ----------------------------------------------------
 # FEATURE ENGINEERING
-# ---------------------------
+# ----------------------------------------------------
 
 def compute_features_for_dozen(
     history: List[Set[int]],
@@ -236,9 +236,9 @@ def compute_scaler(X: np.ndarray):
     return mean_, std_
 
 
-# ---------------------------
+# ----------------------------------------------------
 # SALVAR / CARREGAR MODELO
-# ---------------------------
+# ----------------------------------------------------
 
 def save_model(wrapper: ModelWrapper, path: str = MODEL_PATH):
     np.savez(
@@ -279,9 +279,9 @@ def load_model_local(path: str = MODEL_PATH) -> ModelWrapper:
     return wrapper
 
 
-# ---------------------------
-# GERAÇÃO DE APOSTAS
-# ---------------------------
+# ----------------------------------------------------
+# GERAÇÃO DE PROBABILIDADES E APOSTAS
+# ----------------------------------------------------
 
 def gerar_probabilidades_para_proximo(history: List[Set[int]], model: ModelWrapper) -> np.ndarray:
     if len(history) < 2:
@@ -301,6 +301,9 @@ def gerar_probabilidades_para_proximo(history: List[Set[int]], model: ModelWrapp
 
 
 def gerar_apostas_e_espelhos(history: List[Set[int]], model: ModelWrapper):
+    """
+    Versão simples – não usada no Oráculo Supremo, mas mantida se precisar.
+    """
     probs = gerar_probabilidades_para_proximo(history, model)
     idx_sorted_desc = np.argsort(-probs).tolist()  # maior probabilidade primeiro
 
@@ -332,6 +335,7 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
     erro3 = idx_sorted_asc[20:70]
 
     return [erro1, erro2, erro3]
+
 
 def treino_incremental_pos_concurso(history: List[Set[int]], resultado_set: set[int]):
     """
@@ -425,7 +429,7 @@ def gerar_apostas_oraculo_supremo(history: List[Set[int]], model: ModelWrapper):
     #   RUÍDO ADAPTATIVO – muda A CADA EXECUÇÃO
     # ====================================================
     rng = np.random.default_rng()
-    ruido = rng.normal(0, 0.05, size=probs.shape)  # antes era 0.01 !
+    ruido = rng.normal(0, 0.05, size=probs.shape)  # ruído um pouco maior p/ variar mais
     probs_ruido = probs + ruido
     probs_ruido = np.clip(probs_ruido, 1e-9, None)
     probs_ruido = probs_ruido / probs_ruido.sum()
@@ -438,7 +442,7 @@ def gerar_apostas_oraculo_supremo(history: List[Set[int]], model: ModelWrapper):
 
     aposta1 = cand_rep[:20]  # 20 repetidas
     restantes = [int(d) for d in np.argsort(-probs) if d not in aposta1]
-    aposta1 += restantes[:30]  # completar 50
+    aposta1 += restantes[: (50 - len(aposta1))]
     aposta1 = sorted(aposta1)
 
     # ====================================================
@@ -485,9 +489,9 @@ def format_dezenas_sortidas(dezenas):
     return " ".join(f"{d:02d}" for d in sorted(dezenas))
 
 
-# ---------------------------
+# ----------------------------------------------------
 # HANDLERS TELEGRAM
-# ---------------------------
+# ----------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -569,7 +573,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         apostas_py = [[int(x) for x in ap] for ap in apostas]
         espelhos_py = [[int(x) for x in esp] for esp in espelhos]
 
-    except Exception as e:
+    except Exception:
         logger.exception("Erro ao ler arquivo de última geração.")
         await update.message.reply_text(
             "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
@@ -773,6 +777,10 @@ async def errar_tudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Erro ao gerar apostas de erro")
         await update.message.reply_text(f"❌ Erro ao gerar apostas de erro: {e}")
 
+
+# ----------------------------------------------------
+# MAIN
+# ----------------------------------------------------
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
