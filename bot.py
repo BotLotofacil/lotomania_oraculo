@@ -590,14 +590,14 @@ def gerar_apostas_oraculo_supremo(
     history: List[Set[int]], model: ModelWrapper
 ):
     """
-    Oráculo Supremo – 6 apostas totalmente independentes:
+    Oráculo Supremo – 6 apostas totalmente independentes e diversificadas:
 
-      1 – Repetição
-      2 – Ciclos
-      3 – Probabilística real
-      4 – Híbrida (prob + ciclos)
-      5 – Quentes
-      6 – Frias
+      1 – Repetição inteligente (poucas repetidas + top prob)
+      2 – Ciclos (atraso forte + probabilidade)
+      3 – Probabilística real (amostragem nas probs com ruído)
+      4 – Híbrida (CNN/MLP + freq + ciclos, evitando reuso)
+      5 – Quentes (multi-janela 10/30/200)
+      6 – Frias (baixa freq + atraso alto, evitando reuso)
     """
 
     if len(history) < 5:
@@ -610,16 +610,32 @@ def gerar_apostas_oraculo_supremo(
     probs = np.clip(probs, 1e-9, None)
     probs = probs / probs.sum()
 
-    # ====================================================
-    #   FREQUÊNCIAS (QUENTES) E ATRASOS (FRIAS)
-    # ====================================================
-    janela = min(200, len(history))
-    freq = np.zeros(100, dtype=np.int32)
+    n_hist = len(history)
 
-    for conc in history[-janela:]:
+    # ====================================================
+    #   FREQUÊNCIAS (QUENTES) EM MÚLTIPLAS JANELAS
+    # ====================================================
+    janela_long = min(200, n_hist)
+    freq_long = np.zeros(100, dtype=np.int32)
+    for conc in history[-janela_long:]:
         for d in conc:
-            freq[d] += 1
+            freq_long[d] += 1
 
+    janela10 = min(10, n_hist)
+    freq10 = np.zeros(100, dtype=np.int32)
+    for conc in history[-janela10:]:
+        for d in conc:
+            freq10[d] += 1
+
+    janela30 = min(30, n_hist)
+    freq30 = np.zeros(100, dtype=np.int32)
+    for conc in history[-janela30:]:
+        for d in conc:
+            freq30[d] += 1
+
+    # ====================================================
+    #   ATRASOS (FRIAS)
+    # ====================================================
     atrasos = np.zeros(100, dtype=np.int32)
     for d in range(100):
         gap = 0
@@ -633,51 +649,162 @@ def gerar_apostas_oraculo_supremo(
     #   RUÍDO ADAPTATIVO – muda A CADA EXECUÇÃO
     # ====================================================
     rng = np.random.default_rng()
-    ruido = rng.normal(0, 0.05, size=probs.shape)  # ruído um pouco maior p/ variar mais
+    ruido = rng.normal(0, 0.08, size=probs.shape)  # ruído um pouco maior p/ variar mais
     probs_ruido = probs + ruido
     probs_ruido = np.clip(probs_ruido, 1e-9, None)
     probs_ruido = probs_ruido / probs_ruido.sum()
 
+    # ----------------------------------------------------
+    # Normalizações auxiliares
+    # ----------------------------------------------------
+    def _norm(arr: np.ndarray) -> np.ndarray:
+        arr = arr.astype(np.float32)
+        maxv = float(arr.max())
+        if maxv <= 0.0:
+            return np.zeros_like(arr, dtype=np.float32)
+        return arr / maxv
+
+    freq_long_n = _norm(freq_long)
+    freq10_n = _norm(freq10)
+    freq30_n = _norm(freq30)
+    atraso_n = _norm(atrasos)
+    probs_n = _norm(probs)
+
     # ====================================================
-    #   APOSTA 1 – REPETIÇÃO (prioriza dezenas do último concurso)
+    #   APOSTA 1 – REPETIÇÃO INTELIGENTE
+    #   (poucas repetidas + top CNN/MLP)
     # ====================================================
     ultimo = history[-1]
-    cand_rep = sorted(list(ultimo), key=lambda d: probs[d], reverse=True)
+    cand_rep_ordenados = sorted(list(ultimo), key=lambda d: probs[d], reverse=True)
+    n_rep = min(12, len(cand_rep_ordenados))  # limita repetição para não "colar" demais
+    base_ap1 = cand_rep_ordenados[:n_rep]
 
-    aposta1 = cand_rep[:20]  # 20 repetidas
-    restantes = [int(d) for d in np.argsort(-probs) if d not in aposta1]
-    aposta1 += restantes[: (50 - len(aposta1))]
+    restantes_ordem = [int(d) for d in np.argsort(-probs) if d not in base_ap1]
+    aposta1 = base_ap1 + restantes_ordem[: (50 - len(base_ap1))]
     aposta1 = sorted(aposta1)
 
     # ====================================================
-    #   APOSTA 2 – CICLOS (prioriza atrasadas com prob alta)
+    #   APOSTA 2 – CICLOS (atraso forte + probabilidade)
+    #   Diversificada em relação à Aposta 1
     # ====================================================
-    score_ciclo = (probs ** 0.6) * (1.0 + atrasos / max(atrasos))
-    idx_ciclo = np.argsort(score_ciclo)[-50:]
-    aposta2 = sorted(idx_ciclo.tolist())
+    ciclo_score = (probs_n ** 0.7) * (1.0 + atraso_n * 1.5)
+    idx_ciclo_pool = np.argsort(ciclo_score)[-70:]  # pool maior
+
+    aposta2 = []
+    usados_ap1 = set(aposta1)
+    for d in reversed(idx_ciclo_pool):
+        if d in usados_ap1:
+            continue
+        aposta2.append(int(d))
+        if len(aposta2) == 50:
+            break
+
+    if len(aposta2) < 50:
+        usados = set(aposta2)
+        for d in np.argsort(ciclo_score)[::-1]:
+            if d in usados:
+                continue
+            aposta2.append(int(d))
+            if len(aposta2) == 50:
+                break
+
+    aposta2 = sorted(aposta2)
 
     # ====================================================
-    #   APOSTA 3 – PROBABILÍSTICA REAL (amostragem nas probs com ruído)
+    #   APOSTA 3 – PROBABILÍSTICA REAL
+    #   (amostragem nas probs com ruído + tempering)
     # ====================================================
-    aposta3 = sorted(rng.choice(100, size=50, replace=False, p=probs_ruido))
+    temp = 0.85
+    probs_temp = probs_ruido ** temp
+    probs_temp = np.clip(probs_temp, 1e-9, None)
+    probs_temp = probs_temp / probs_temp.sum()
+
+    aposta3 = sorted(rng.choice(100, size=50, replace=False, p=probs_temp))
 
     # ====================================================
-    #   APOSTA 4 – HÍBRIDA (prob + ciclos não-linear)
+    #   APOSTA 4 – HÍBRIDA (CNN/MLP + freq + atraso)
+    #   Evita reuso pesado de dezenas já presentes nas 1–3
     # ====================================================
-    score_hibrido = (probs ** 0.5) * (1.0 + atrasos ** 0.4)
-    idx_hib = np.argsort(score_hibrido)[-50:]
-    aposta4 = sorted(idx_hib.tolist())
+    score_hibrido = (
+        0.6 * probs_n +
+        0.2 * atraso_n +
+        0.2 * freq_long_n
+    )
+    idx_hib_pool = np.argsort(score_hibrido)[-80:]
+
+    usados_1a3 = set(aposta1) | set(aposta2) | set(aposta3)
+    aposta4 = []
+    for d in reversed(idx_hib_pool):
+        if d in usados_1a3:
+            continue
+        aposta4.append(int(d))
+        if len(aposta4) == 50:
+            break
+
+    if len(aposta4) < 50:
+        usados = set(aposta4)
+        for d in np.argsort(score_hibrido)[::-1]:
+            if d in usados:
+                continue
+            aposta4.append(int(d))
+            if len(aposta4) == 50:
+                break
+
+    aposta4 = sorted(aposta4)
 
     # ====================================================
-    #   APOSTA 5 – QUENTES (freq)
+    #   APOSTA 5 – QUENTES (multi-janela 10/30/200)
+    #   f10 > f30 > f200
     # ====================================================
-    aposta5 = sorted(np.argsort(freq)[-50:].tolist())
+    quente_score = 0.5 * freq10_n + 0.3 * freq30_n + 0.2 * freq_long_n
+    idx_quentes_pool = np.argsort(quente_score)[-80:]
+
+    usados_1a4 = usados_1a3 | set(aposta4)
+    aposta5 = []
+    for d in reversed(idx_quentes_pool):
+        if d in usados_1a4:
+            continue
+        aposta5.append(int(d))
+        if len(aposta5) == 50:
+            break
+
+    if len(aposta5) < 50:
+        usados = set(aposta5)
+        for d in np.argsort(quente_score)[::-1]:
+            if d in usados:
+                continue
+            aposta5.append(int(d))
+            if len(aposta5) == 50:
+                break
+
+    aposta5 = sorted(aposta5)
 
     # ====================================================
-    #   APOSTA 6 – FRIAS (freq baixa + atraso alto)
+    #   APOSTA 6 – FRIAS (baixa freq + atraso alto)
+    #   Evita reuso das demais
     # ====================================================
-    score_frio = freq * 0.2 + atrasos * 0.8
-    aposta6 = sorted(np.argsort(score_frio)[:50].tolist())
+    frias_score = 0.6 * atraso_n + 0.4 * (1.0 - freq_long_n)
+    idx_frias_pool = np.argsort(frias_score)[-80:]  # maiores scores = mais "frias relevantes"
+
+    usados_1a5 = usados_1a4 | set(aposta5)
+    aposta6 = []
+    for d in reversed(idx_frias_pool):
+        if d in usados_1a5:
+            continue
+        aposta6.append(int(d))
+        if len(aposta6) == 50:
+            break
+
+    if len(aposta6) < 50:
+        usados = set(aposta6)
+        for d in np.argsort(frias_score)[::-1]:
+            if d in usados:
+                continue
+            aposta6.append(int(d))
+            if len(aposta6) == 50:
+                break
+
+    aposta6 = sorted(aposta6)
 
     # ====================================================
     #   ESPELHOS
