@@ -1,4 +1,4 @@
-# ORACULO.py – Oráculo Lotomania – Modo C (Híbrido CNN + MLP)
+# ORACULO.py – Oráculo Lotomania – Modo C (Híbrido CNN + MLP) – Modo Intensivo
 
 import json
 import time
@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------
-# REDE NEURAL HÍBRIDA – CNN 1D + MLP
+# REDE NEURAL HÍBRIDA – CNN 1D + MLP (MODO INTENSIVO)
 # ----------------------------------------------------
 
 
@@ -47,10 +47,10 @@ class HybridCNNMLP:
         self,
         seq_len: int,
         feat_dim: int,
-        conv_channels: int = 8,
-        kernel_size: int = 5,
-        hidden_dim: int = 32,
-        lr: float = 0.01,
+        conv_channels: int = 16,   # antes 8 → agora CNN mais forte
+        kernel_size: int = 7,      # antes 5 → kernel maior (mais contexto temporal)
+        hidden_dim: int = 64,      # antes 32 → MLP mais robusto
+        lr: float = 0.008,         # leve ajuste de learning rate para estabilidade
         seed: int = 42,
     ):
         self.seq_len = seq_len
@@ -164,7 +164,7 @@ class HybridCNNMLP:
                     y_hat,
                 ) = cache
 
-                # Gradiente BCE (mesmo esquema do MLP simples)
+                # Gradiente BCE
                 m = B
                 dz2 = (y_hat - yb) / m  # (B, 1)
                 dW2 = a1.T @ dz2
@@ -179,10 +179,8 @@ class HybridCNNMLP:
 
                 C = self.conv_channels
                 dconv_feat = dconcat[:, :C]  # gradiente na saída do branch CNN
-                # dX_feat = dconcat[:, C:]  # gradiente nas features manuais (não usado externamente)
 
                 # Backprop no pooling:
-                # conv_feat[b, c] = mean_t conv_act[b, t, c]
                 B2, Lw, C2 = conv_act.shape
                 assert B2 == B and C2 == C
 
@@ -535,10 +533,10 @@ def treino_incremental_pos_concurso(
     history: List[Set[int]], resultado_set: set[int]
 ):
     """
-    Treino incremental leve, pós-concurso:
+    Treino incremental intensivo, pós-concurso:
     - usa o ÚLTIMO ponto da linha do tempo do histórico
     - calcula sequência + features da dezena
-    - faz um passo de treino com o resultado confirmado
+    - faz um passo de treino mais forte com o resultado confirmado
     """
     try:
         wrapper = load_model_local()
@@ -575,15 +573,15 @@ def treino_incremental_pos_concurso(
     # scaler já existente
     X_feat_scaled = (X_feat - wrapper.mean_feat) / wrapper.std_feat
 
-    # passo rápido de ajuste
-    net.fit(X_ts, X_feat_scaled, y, epochs=10, batch_size=100)
+    # MODO INTENSIVO: mais épocas e batch menor
+    net.fit(X_ts, X_feat_scaled, y, epochs=35, batch_size=64)
 
     # salva e atualiza cache
     save_model(wrapper)
     global _model_cache
     _model_cache = wrapper
 
-    logger.info("Treino incremental pós-concurso concluído (híbrido CNN+MLP).")
+    logger.info("Treino incremental pós-concurso concluído (modo intensivo CNN+MLP).")
 
 
 def gerar_apostas_oraculo_supremo(
@@ -827,11 +825,12 @@ def format_dezenas_sortidas(dezenas):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🔮 Oráculo Lotomania – Modo C (Híbrido CNN + MLP)\n\n"
-        "/treinar - treina ou atualiza a rede neural híbrida\n"
+        "🔮 Oráculo Lotomania – Modo C (Híbrido CNN + MLP – Intensivo)\n\n"
+        "/treinar - treina ou atualiza a rede neural híbrida (treino forte)\n"
         "/gerar - Oráculo Supremo (6 apostas + 6 espelhos)\n"
         "/errar_tudo - gera 3 apostas tentando errar tudo\n"
-        "/confirmar - confronta o resultado oficial com o último bloco gerado\n\n"
+        "/confirmar - confronta o resultado oficial com o último bloco gerado "
+        "e aplica treino intensivo no modelo\n\n"
         "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado."
     )
     await update.message.reply_text(msg)
@@ -844,7 +843,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     1) Lê a última geração salva pelo /gerar ou /errar_tudo
     2) Compara o resultado com as apostas + espelhos
     3) Salva histórico de acertos em CSV
-    4) Dispara treino incremental da rede neural híbrida
+    4) Dispara treino incremental INTENSIVO da rede neural híbrida
     """
     texto = (update.message.text or "").strip()
     partes = texto.split()
@@ -981,12 +980,12 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Erro ao salvar desempenho em CSV: %s", e_csv)
 
     # ----------------------------------
-    # 5) Treino incremental da rede neural híbrida
+    # 5) Treino incremental da rede neural híbrida (MODO INTENSIVO)
     # ----------------------------------
     try:
         history = load_history(HISTORY_PATH)
         treino_incremental_pos_concurso(history, resultado_set)
-        txt_treino = "\n🧠 Treino incremental aplicado ao modelo (CNN+MLP)."
+        txt_treino = "\n🧠 Treino incremental INTENSIVO aplicado ao modelo (CNN+MLP)."
     except Exception as e_inc:
         logger.exception("Erro no treino incremental pós-concurso: %s", e_inc)
         txt_treino = "\n⚠️ Não foi possível aplicar o treino incremental (ver logs)."
@@ -1040,12 +1039,12 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text("🧠 Iniciando treinamento híbrido (CNN + MLP) com o histórico...")
+        await update.message.reply_text("🧠 Iniciando treinamento híbrido (CNN + MLP – modo intensivo) com o histórico...")
 
         history = load_history(HISTORY_PATH)
 
-        # Define seq_len padrão (ajuste se quiser mais longo)
-        seq_len_default = 40
+        # seq_len mais longo para capturar mais contexto temporal
+        seq_len_default = 60
 
         # Tenta reaproveitar modelo existente (mesmo seq_len)
         wrapper_antigo = None
@@ -1073,16 +1072,18 @@ async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if wrapper_antigo is not None:
             net = wrapper_antigo.net
         else:
+            # CNN mais forte + MLP maior em modo intensivo
             net = HybridCNNMLP(
                 seq_len=seq_len,
                 feat_dim=feat_dim,
-                conv_channels=8,
-                kernel_size=5,
-                hidden_dim=32,
-                lr=0.01,
+                conv_channels=16,
+                kernel_size=7,
+                hidden_dim=64,
+                lr=0.008,
             )
 
-        net.fit(X_ts, X_feat_scaled, y, epochs=60, batch_size=512)
+        # TREINO INTENSIVO GLOBAL
+        net.fit(X_ts, X_feat_scaled, y, epochs=100, batch_size=512)
 
         wrapper = ModelWrapper(net, mean_feat, std_feat, seq_len)
         save_model(wrapper)
@@ -1090,7 +1091,8 @@ async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _model_cache = wrapper
 
         await update.message.reply_text(
-            f"✅ Treinamento concluído (híbrido CNN+MLP). Amostras usadas: {len(y)}\n"
+            f"✅ Treinamento concluído (híbrido CNN+MLP – modo intensivo).\n"
+            f"Amostras usadas: {len(y)}\n"
             f"seq_len = {seq_len}"
         )
 
@@ -1212,7 +1214,7 @@ def main():
     app.add_handler(CommandHandler("errar_tudo", errar_tudo_cmd))
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
 
-    logger.info("Bot Lotomania (Oráculo CNN+MLP) iniciado.")
+    logger.info("Bot Lotomania (Oráculo CNN+MLP – modo intensivo) iniciado.")
     app.run_polling()
 
 
