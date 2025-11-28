@@ -531,29 +531,67 @@ def load_model_local(path: str = MODEL_PATH) -> ModelWrapper:
 
 def carregar_melhor_info() -> dict:
     """
-    Lê o JSON de melhor desempenho: {best_hits, best_media}.
+    Lê o JSON de melhor desempenho: {
+        best_hits,
+        best_media,
+        (opcional) best_pattern,
+        (opcional) best_ap_index
+    }.
     Se não existir, retorna valores padrão.
     """
     if not os.path.exists(BEST_SCORE_PATH):
-        return {"best_hits": 0, "best_media": 0.0}
+        return {
+            "best_hits": 0,
+            "best_media": 0.0,
+            "best_pattern": [],
+            "best_ap_index": 0,
+        }
     try:
         with open(BEST_SCORE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("formato inválido")
+
+        best_hits = int(data.get("best_hits", 0))
+        best_media = float(data.get("best_media", 0.0))
+
+        raw_pattern = data.get("best_pattern") or []
+        if isinstance(raw_pattern, list):
+            best_pattern = [int(d) for d in raw_pattern if 0 <= int(d) <= 99]
+        else:
+            best_pattern = []
+
+        best_ap_index = int(data.get("best_ap_index", 0))
+
         return {
-            "best_hits": int(data.get("best_hits", 0)),
-            "best_media": float(data.get("best_media", 0.0)),
+            "best_hits": best_hits,
+            "best_media": best_media,
+            "best_pattern": best_pattern,
+            "best_ap_index": best_ap_index,
         }
     except Exception as e:
         logger.warning("Erro ao ler %s: %s. Usando padrão.", BEST_SCORE_PATH, e)
-        return {"best_hits": 0, "best_media": 0.0}
+        return {
+            "best_hits": 0,
+            "best_media": 0.0,
+            "best_pattern": [],
+            "best_ap_index": 0,
+        }
 
 
-def registrar_melhor_modelo(melhor_hits_atual: int, media_atual: float) -> bool:
+def registrar_melhor_modelo(
+    melhor_hits_atual: int,
+    media_atual: float,
+    aposta_campea: list[int] | None = None,
+    idx_campeao: int | None = None,
+) -> bool:
     """
     Se o lote atual for melhor que o anterior (por hits e média),
     copia o MODEL_PATH para BEST_MODEL_PATH e atualiza BEST_SCORE_PATH.
+
+    Também registra:
+      - best_pattern: dezenas da aposta campeã
+      - best_ap_index: índice (1..6) da aposta campeã
 
     Retorna True se um novo melhor modelo foi salvo.
     """
@@ -576,10 +614,20 @@ def registrar_melhor_modelo(melhor_hits_atual: int, media_atual: float) -> bool:
 
     try:
         shutil.copy2(MODEL_PATH, BEST_MODEL_PATH)
+
         info_new = {
             "best_hits": int(melhor_hits_atual),
             "best_media": float(media_atual),
         }
+
+        if aposta_campea is not None:
+            # salva padrão da aposta campeã (ordenado, sem duplicatas)
+            pattern = sorted({int(d) for d in aposta_campea if 0 <= int(d) <= 99})
+            info_new["best_pattern"] = pattern
+
+        if idx_campeao is not None:
+            info_new["best_ap_index"] = int(idx_campeao)
+
         with open(BEST_SCORE_PATH, "w", encoding="utf-8") as f:
             json.dump(info_new, f, ensure_ascii=False, indent=2)
 
@@ -744,13 +792,18 @@ def gerar_apostas_oraculo_supremo(
       4 – Híbrida (CNN/MLP + freq + ciclos, evitando reuso)
       5 – Quentes (multi-janela 10/30/200)
       6 – Frias (baixa freq + atraso alto, evitando reuso)
+
+    Após existir um recorde >= 15 acertos, a aposta campeã passa
+    a ser gerada com âncora 70/30:
+      - ~70% das dezenas da campeã fixas
+      - ~30% de variação leve guiada pelas probabilidades da rede
     """
 
     if len(history) < 5:
         raise ValueError("Histórico insuficiente para Oráculo Supremo.")
 
     # ====================================================
-    #   PROBABILIDADES DA REDE – NORMALIZADAS
+    #   PROBABILIDADES DA REDE – NORMALIZADAS (base)
     # ====================================================
     probs = gerar_probabilidades_para_proximo(history, model)
     probs = np.clip(probs, 1e-9, None)
@@ -953,10 +1006,47 @@ def gerar_apostas_oraculo_supremo(
     aposta6 = sorted(aposta6)
 
     # ====================================================
+    #   ANCORAGEM 70/30 NA APOSTA CAMPEÃ (se houver recorde >= 15)
+    # ====================================================
+    apostas = [aposta1, aposta2, aposta3, aposta4, aposta5, aposta6]
+
+    best_info = carregar_melhor_info()
+    best_hits = int(best_info.get("best_hits", 0))
+    best_pattern = best_info.get("best_pattern") or []
+    best_ap_index = int(best_info.get("best_ap_index", 0))
+
+    if best_hits >= 15 and isinstance(best_pattern, list) and len(best_pattern) >= 10:
+        idx_anchor = best_ap_index - 1  # converter 1..6 -> 0..5
+        if 0 <= idx_anchor < len(apostas):
+            # garante conjunto válido de dezenas
+            campea = sorted({int(d) for d in best_pattern if 0 <= int(d) <= 99})
+            if len(campea) > 0:
+                n_total = 50
+                frac_fixo = 0.70
+                n_fixo = min(len(campea), int(round(n_total * frac_fixo)))
+
+                # fixa as dezenas da campeã com maior probabilidade atual
+                campea_ordenada = sorted(campea, key=lambda d: probs[d], reverse=True)
+                fixas = campea_ordenada[:n_fixo]
+                fixas_set = set(fixas)
+
+                # preenche o restante com dezenas de maior probabilidade fora do conjunto fixo
+                variavel = []
+                for d in np.argsort(-probs):
+                    d_int = int(d)
+                    if d_int in fixas_set:
+                        continue
+                    variavel.append(d_int)
+                    if len(fixas) + len(variavel) == n_total:
+                        break
+
+                aposta_ancorada = sorted(fixas + variavel)
+                apostas[idx_anchor] = aposta_ancorada
+
+    # ====================================================
     #   ESPELHOS
     # ====================================================
     universo = set(range(100))
-    apostas = [aposta1, aposta2, aposta3, aposta4, aposta5, aposta6]
     espelhos = [sorted(universo - set(ap)) for ap in apostas]
 
     return apostas, espelhos
@@ -1255,7 +1345,12 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt_best = ""
     if TREINO_HABILITADO:
         try:
-            if registrar_melhor_modelo(melhor_hits, media_hits):
+            if registrar_melhor_modelo(
+                melhor_hits,
+                media_hits,
+                aposta_campea=apostas_py[melhor_ap_idx],
+                idx_campeao=(melhor_ap_idx + 1),
+            ):
                 txt_best = (
                     "\n🏆 Este lote superou o melhor desempenho anterior.\n"
                     "   Modelo atual salvo como 'lotomania_model_best.npz' "
@@ -1510,7 +1605,7 @@ def main():
     app.add_handler(CommandHandler("errar_tudo", errar_tudo_cmd))
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
 
-    logger.info("Bot Lotomania (Oráculo CNN+MLP – modo intensivo + whitelist) iniciado.")
+    logger.info("Bot Lotomania (Oráculo CNN+MLP – modo intensivo + whitelist + 70/30 campeão) iniciado.")
     app.run_polling()
 
 
