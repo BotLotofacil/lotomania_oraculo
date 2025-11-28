@@ -996,6 +996,10 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     4) Salva histórico de acertos em CSV
     5) (Opcional) Dispara treino incremental INTENSIVO da rede neural híbrida
     6) (Opcional) Atualiza snapshot do melhor modelo
+       + Congelamento rígido 15+ (Opção A):
+         - Enquanto nenhum recorde tiver 15+, todos os lotes treinam normal
+         - Após um recorde com 15+ acertos, o modelo fica TRAVADO
+         - Só volta a treinar se surgir um novo lote que supere o recorde
     """
     # ------------------------------------------------
     # 0) Verifica se usuário está na whitelist
@@ -1063,7 +1067,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         apostas = dados.get("apostas")
         espelhos = dados.get("espelhos")
         modo = dados.get("modo", "oraculo")  # "oraculo" ou "errar_tudo"
-        user_id_gerador = dados.get("user_id")  # novo campo: quem gerou o bloco
+        user_id_gerador = dados.get("user_id")  # quem gerou o bloco
 
         if not apostas or not espelhos:
             raise ValueError("Dados incompletos na última geração.")
@@ -1117,10 +1121,27 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     melhor_hits = int(hits_apostas[melhor_ap_idx])
     media_hits = float(sum(hits_apostas) / n_apostas)
 
-    # Classificação do lote (heurística para Lotomania 50/100)
-    if melhor_hits >= 13:
-        classe_lote = "Lote EXCELENTE — modelo travado como forte referência."
-        epochs_inc = 18
+    # ----------------------------------
+    # 3.1) Lê recorde histórico para aplicar congelamento rígido 15+
+    # ----------------------------------
+    best_info = carregar_melhor_info()
+    best_hits_ref = int(best_info.get("best_hits", 0))
+    best_media_ref = float(best_info.get("best_media", 0.0))
+
+    # Congelamento rígido (Opção A):
+    # - Só entra em modo travado depois que existir um recorde >= 15
+    # - Enquanto recorde >= 15 E o lote atual NÃO superar esse recorde → NÃO treina
+    locked_rigid = (best_hits_ref >= 15) and (melhor_hits <= best_hits_ref)
+
+    # ----------------------------------
+    # 3.2) Classificação do lote (ajuste de epochs)
+    #      (texto atualizado para alinhar com o congelamento 15+)
+    # ----------------------------------
+    if melhor_hits >= 15:
+        classe_lote = (
+            "Lote EXCELENTE — atingiu 15+ acertos (zona de congelamento rígido)."
+        )
+        epochs_inc = 20
     elif melhor_hits >= 11:
         classe_lote = "Lote forte — reforço mais intenso aplicado nas dezenas-chave."
         epochs_inc = 28
@@ -1179,9 +1200,13 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Erro ao salvar desempenho em CSV: %s", e_csv)
 
     # ----------------------------------
-    # 5) Treino incremental da rede neural híbrida (MODO INTENSIVO, mas controlado)
+    # 5) Treino incremental (INTENSIVO) com congelamento rígido 15+
     # ----------------------------------
-    if TREINO_HABILITADO:
+    if TREINO_HABILITADO and not locked_rigid:
+        # 🔓 Modo livre / destravado:
+        # - Ainda não existe recorde 15+
+        #   OU
+        # - Esse lote SUPEROU o recorde atual (novo recorde)
         try:
             history = load_history(HISTORY_PATH)
         except Exception as e_hist:
@@ -1207,7 +1232,17 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 txt_treino = "\n⚠️ Não foi possível aplicar o treino incremental (ver logs)."
         else:
             txt_treino = "\n⚠️ Não foi possível carregar o histórico para treino incremental."
+    elif TREINO_HABILITADO and locked_rigid:
+        # 🧊 Modo TRAVADO (recorde 15+ já existe e este lote NÃO o superou)
+        txt_treino = (
+            "\n🧊 Congelamento rígido 15+ ATIVO.\n"
+            f"   • Recorde atual: {best_hits_ref} acertos "
+            "(modelo referência salvo em 'lotomania_model_best.npz').\n"
+            "   • Este /confirmar NÃO alterou o modelo — apenas registrou desempenho em CSV.\n"
+            "   • O treino só será liberado novamente quando UM NOVO LOTE superar esse recorde."
+        )
     else:
+        # TREINO_HABILITADO = False → modo avaliação pura
         txt_treino = (
             "\nℹ️ Modo avaliação: /confirmar NÃO está ajustando o modelo "
             "(apenas registrando o desempenho em CSV)."
@@ -1215,11 +1250,10 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ----------------------------------
     # 5.1) Atualiza snapshot do melhor modelo (se houver melhoria)
+    #      (usa o estado ATUAL do modelo; quando travado, nada muda aqui)
     # ----------------------------------
     txt_best = ""
     if TREINO_HABILITADO:
-        # Snapshot é feito ANTES de qualquer novo treino nas próximas execuções:
-        # aqui usamos o desempenho deste lote como métrica de "estado atual".
         try:
             if registrar_melhor_modelo(melhor_hits, media_hits):
                 txt_best = (
