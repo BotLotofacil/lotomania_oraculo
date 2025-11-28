@@ -1,10 +1,11 @@
-# ORACULO.py – Oráculo Lotomania – Modo C (Híbrido CNN + MLP) – Modo Intensivo
+# ORACULO.py – Oráculo Lotomania – Modo C (Híbrido CNN + MLP) – Modo Intensivo + Whitelist + Aprendizado Inteligente
 
 import json
 import time
 import os
 import csv
 import logging
+import shutil
 from typing import List, Set
 
 import numpy as np
@@ -16,7 +17,11 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # Caminhos de arquivos principais
 # ----------------------------------------------------
 HISTORY_PATH = "lotomania_historico_onehot.csv"   # histórico one-hot (00–99)
-MODEL_PATH = "lotomania_model.npz"                # pesos da rede neural
+MODEL_PATH = "lotomania_model.npz"                # pesos da rede neural (modelo atual)
+
+# Snapshot do melhor modelo já visto (para você poder voltar se quiser)
+BEST_MODEL_PATH = "lotomania_model_best.npz"
+BEST_SCORE_PATH = "lotomania_best_score.json"
 
 # Arquivo para guardar o último lote gerado (para o /confirmar)
 ULTIMA_GERACAO_PATH = "ultima_geracao_oraculo.json"
@@ -24,11 +29,76 @@ ULTIMA_GERACAO_PATH = "ultima_geracao_oraculo.json"
 # Arquivo de telemetria de desempenho
 DESEMPENHO_PATH = "desempenho_oraculo.csv"
 
+# Arquivo de whitelist (user_ids autorizados)
+WHITELIST_PATH = "whitelist.txt"
+
+# Flag global: se False, /confirmar só valida acertos (não treina o modelo)
+TREINO_HABILITADO = True
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Cache simples para whitelist em memória (recarregado a cada uso rápido)
+_whitelist_cache: set[int] | None = None
+
+# ----------------------------------------------------
+# Funções de controle de acesso (whitelist)
+# ----------------------------------------------------
+
+
+def load_whitelist_ids() -> set[int]:
+    """
+    Lê o arquivo whitelist.txt e devolve um set de user_ids (int).
+    Linhas vazias ou iniciadas por '#' são ignoradas.
+    """
+    global _whitelist_cache
+
+    # Se já carregado uma vez, reaproveita: o arquivo é pequeno
+    # e se você editar o whitelist.txt basta reiniciar o bot.
+    if _whitelist_cache is not None:
+        return _whitelist_cache
+
+    ids: set[int] = set()
+    try:
+        with open(WHITELIST_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    ids.add(int(line))
+                except ValueError:
+                    logger.warning("Linha inválida no whitelist.txt (não é inteiro): %r", line)
+    except FileNotFoundError:
+        logger.warning(
+            "Arquivo de whitelist não encontrado (%s). "
+            "Sem ele, ninguém terá acesso a /confirmar ou /treinar.",
+            WHITELIST_PATH,
+        )
+
+    _whitelist_cache = ids
+    return ids
+
+
+def is_user_whitelisted(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    wl = load_whitelist_ids()
+    return user.id in wl
+
+
+def get_user_label(update: Update) -> str:
+    user = update.effective_user
+    if not user:
+        return "usuário"
+    if user.username:
+        return f"@{user.username}"
+    return f"{user.full_name} (id={user.id})"
+
 
 # ----------------------------------------------------
 # REDE NEURAL HÍBRIDA – CNN 1D + MLP (MODO INTENSIVO)
@@ -455,6 +525,77 @@ def load_model_local(path: str = MODEL_PATH) -> ModelWrapper:
 
 
 # ----------------------------------------------------
+# Snapshot do melhor modelo
+# ----------------------------------------------------
+
+
+def carregar_melhor_info() -> dict:
+    """
+    Lê o JSON de melhor desempenho: {best_hits, best_media}.
+    Se não existir, retorna valores padrão.
+    """
+    if not os.path.exists(BEST_SCORE_PATH):
+        return {"best_hits": 0, "best_media": 0.0}
+    try:
+        with open(BEST_SCORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("formato inválido")
+        return {
+            "best_hits": int(data.get("best_hits", 0)),
+            "best_media": float(data.get("best_media", 0.0)),
+        }
+    except Exception as e:
+        logger.warning("Erro ao ler %s: %s. Usando padrão.", BEST_SCORE_PATH, e)
+        return {"best_hits": 0, "best_media": 0.0}
+
+
+def registrar_melhor_modelo(melhor_hits_atual: int, media_atual: float) -> bool:
+    """
+    Se o lote atual for melhor que o anterior (por hits e média),
+    copia o MODEL_PATH para BEST_MODEL_PATH e atualiza BEST_SCORE_PATH.
+
+    Retorna True se um novo melhor modelo foi salvo.
+    """
+    if not os.path.exists(MODEL_PATH):
+        logger.warning("MODEL_PATH não encontrado; não há modelo para snapshot.")
+        return False
+
+    info_ant = carregar_melhor_info()
+    best_hits_old = info_ant.get("best_hits", 0)
+    best_media_old = info_ant.get("best_media", 0.0)
+
+    improved = False
+    if melhor_hits_atual > best_hits_old:
+        improved = True
+    elif melhor_hits_atual == best_hits_old and media_atual > best_media_old:
+        improved = True
+
+    if not improved:
+        return False
+
+    try:
+        shutil.copy2(MODEL_PATH, BEST_MODEL_PATH)
+        info_new = {
+            "best_hits": int(melhor_hits_atual),
+            "best_media": float(media_atual),
+        }
+        with open(BEST_SCORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(info_new, f, ensure_ascii=False, indent=2)
+
+        logger.info(
+            "Novo melhor modelo registrado: %d acertos, média %.2f. Snapshot salvo em %s",
+            melhor_hits_atual,
+            media_atual,
+            BEST_MODEL_PATH,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Falha ao salvar snapshot do melhor modelo: %s", e)
+        return False
+
+
+# ----------------------------------------------------
 # GERAÇÃO DE PROBABILIDADES E APOSTAS
 # ----------------------------------------------------
 
@@ -530,13 +671,16 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
 
 
 def treino_incremental_pos_concurso(
-    history: List[Set[int]], resultado_set: set[int]
+    history: List[Set[int]],
+    resultado_set: set[int],
+    epochs: int = 35,
+    batch_size: int = 64,
 ):
     """
     Treino incremental intensivo, pós-concurso:
     - usa o ÚLTIMO ponto da linha do tempo do histórico
     - calcula sequência + features da dezena
-    - faz um passo de treino mais forte com o resultado confirmado
+    - faz um passo de treino com o resultado confirmado
     """
     try:
         wrapper = load_model_local()
@@ -573,15 +717,19 @@ def treino_incremental_pos_concurso(
     # scaler já existente
     X_feat_scaled = (X_feat - wrapper.mean_feat) / wrapper.std_feat
 
-    # MODO INTENSIVO: mais épocas e batch menor
-    net.fit(X_ts, X_feat_scaled, y, epochs=35, batch_size=64)
+    net.fit(X_ts, X_feat_scaled, y, epochs=epochs, batch_size=batch_size)
 
     # salva e atualiza cache
     save_model(wrapper)
     global _model_cache
     _model_cache = wrapper
 
-    logger.info("Treino incremental pós-concurso concluído (modo intensivo CNN+MLP).")
+    logger.info(
+        "Treino incremental pós-concurso concluído (modo intensivo CNN+MLP). "
+        "epochs=%d batch_size=%d",
+        epochs,
+        batch_size,
+    )
 
 
 def gerar_apostas_oraculo_supremo(
@@ -826,12 +974,14 @@ def format_dezenas_sortidas(dezenas):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🔮 Oráculo Lotomania – Modo C (Híbrido CNN + MLP – Intensivo)\n\n"
-        "/treinar - treina ou atualiza a rede neural híbrida (treino forte)\n"
+        "/treinar - treina ou atualiza a rede neural híbrida (treino forte) "
+        "(RESTRITO à whitelist)\n"
         "/gerar - Oráculo Supremo (6 apostas + 6 espelhos)\n"
         "/errar_tudo - gera 3 apostas tentando errar tudo\n"
-        "/confirmar - confronta o resultado oficial com o último bloco gerado "
-        "e aplica treino intensivo no modelo\n\n"
-        "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado."
+        "/confirmar - confronta o resultado oficial com o último bloco gerado, "
+        "registra desempenho e, se habilitado, aplica treino incremental (RESTRITO à whitelist)\n\n"
+        "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado.\n"
+        f"Modo treino habilitado: {'SIM' if TREINO_HABILITADO else 'NÃO (apenas avaliação)'}"
     )
     await update.message.reply_text(msg)
 
@@ -841,10 +991,24 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /confirmar 02 08 15 20 24 25 30 34 37 40 43 51 60 62 67 77 81 85 87 94
 
     1) Lê a última geração salva pelo /gerar ou /errar_tudo
-    2) Compara o resultado com as apostas + espelhos
-    3) Salva histórico de acertos em CSV
-    4) Dispara treino incremental INTENSIVO da rede neural híbrida
+    2) Garante que o mesmo usuário que gerou é quem está confirmando
+    3) Compara o resultado com as apostas + espelhos
+    4) Salva histórico de acertos em CSV
+    5) (Opcional) Dispara treino incremental INTENSIVO da rede neural híbrida
+    6) (Opcional) Atualiza snapshot do melhor modelo
     """
+    # ------------------------------------------------
+    # 0) Verifica se usuário está na whitelist
+    # ------------------------------------------------
+    if not is_user_whitelisted(update):
+        usuario = get_user_label(update)
+        await update.message.reply_text(
+            f"⚠️ {usuario}, você não tem permissão para usar /confirmar.\n"
+            "Apenas o proprietário (user_id presente em whitelist.txt) pode confirmar resultados "
+            "e ajustar o modelo."
+        )
+        return
+
     texto = (update.message.text or "").strip()
     partes = texto.split()
 
@@ -899,6 +1063,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         apostas = dados.get("apostas")
         espelhos = dados.get("espelhos")
         modo = dados.get("modo", "oraculo")  # "oraculo" ou "errar_tudo"
+        user_id_gerador = dados.get("user_id")  # novo campo: quem gerou o bloco
 
         if not apostas or not espelhos:
             raise ValueError("Dados incompletos na última geração.")
@@ -912,6 +1077,20 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
             "Use /gerar novamente para criar um novo bloco de apostas e depois /confirmar."
+        )
+        return
+
+    # ----------------------------------
+    # 2.1) Garante que o bloco foi gerado pelo mesmo usuário que está confirmando
+    # ----------------------------------
+    current_user = update.effective_user
+    current_id = current_user.id if current_user else None
+
+    if user_id_gerador is not None and current_id is not None and current_id != user_id_gerador:
+        await update.message.reply_text(
+            "⚠️ O último bloco de apostas foi gerado por outro usuário.\n"
+            "Gere um novo bloco com /gerar antes de usar /confirmar, para treinar apenas em cima "
+            "das apostas que você mesmo gerou."
         )
         return
 
@@ -935,6 +1114,23 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     melhor_ap_idx = int(np.argmax(hits_apostas))  # 0..n-1
     melhor_esp_idx = int(np.argmax(hits_espelhos))
 
+    melhor_hits = int(hits_apostas[melhor_ap_idx])
+    media_hits = float(sum(hits_apostas) / n_apostas)
+
+    # Classificação do lote (heurística para Lotomania 50/100)
+    if melhor_hits >= 13:
+        classe_lote = "Lote EXCELENTE — modelo travado como forte referência."
+        epochs_inc = 18
+    elif melhor_hits >= 11:
+        classe_lote = "Lote forte — reforço mais intenso aplicado nas dezenas-chave."
+        epochs_inc = 28
+    elif melhor_hits >= 9:
+        classe_lote = "Lote mediano — ajuste normal aplicado."
+        epochs_inc = 22
+    else:
+        classe_lote = "Lote fraco — ajuste suave (treino mais cauteloso)."
+        epochs_inc = 16
+
     # ----------------------------------
     # 4) Salva histórico de acertos em CSV
     # ----------------------------------
@@ -953,6 +1149,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "acertos_esp4", "acertos_esp5", "acertos_esp6",
                     "melhor_aposta", "melhor_espelho",
                     "modo",
+                    "melhor_hits", "media_hits",
                 ]
                 writer.writerow(header)
 
@@ -971,6 +1168,8 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 melhor_ap_idx + 1,
                 melhor_esp_idx + 1,
                 modo,
+                melhor_hits,
+                f"{media_hits:.2f}",
             ]
             writer.writerow(row)
 
@@ -980,15 +1179,57 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Erro ao salvar desempenho em CSV: %s", e_csv)
 
     # ----------------------------------
-    # 5) Treino incremental da rede neural híbrida (MODO INTENSIVO)
+    # 5) Treino incremental da rede neural híbrida (MODO INTENSIVO, mas controlado)
     # ----------------------------------
-    try:
-        history = load_history(HISTORY_PATH)
-        treino_incremental_pos_concurso(history, resultado_set)
-        txt_treino = "\n🧠 Treino incremental INTENSIVO aplicado ao modelo (CNN+MLP)."
-    except Exception as e_inc:
-        logger.exception("Erro no treino incremental pós-concurso: %s", e_inc)
-        txt_treino = "\n⚠️ Não foi possível aplicar o treino incremental (ver logs)."
+    if TREINO_HABILITADO:
+        try:
+            history = load_history(HISTORY_PATH)
+        except Exception as e_hist:
+            logger.exception("Erro ao carregar histórico para treino incremental: %s", e_hist)
+            history = None
+
+        if history is not None:
+            try:
+                treino_incremental_pos_concurso(
+                    history,
+                    resultado_set,
+                    epochs=epochs_inc,
+                    batch_size=64,
+                )
+                txt_treino = (
+                    f"\n🧠 Treino incremental INTENSIVO aplicado ao modelo (CNN+MLP).\n"
+                    f"   • Melhor aposta do lote: {melhor_hits} acertos\n"
+                    f"   • Média do lote: {media_hits:.2f} acertos\n"
+                    f"   • Intensidade de treino usada: {epochs_inc} epochs (modo online)"
+                )
+            except Exception as e_inc:
+                logger.exception("Erro no treino incremental pós-concurso: %s", e_inc)
+                txt_treino = "\n⚠️ Não foi possível aplicar o treino incremental (ver logs)."
+        else:
+            txt_treino = "\n⚠️ Não foi possível carregar o histórico para treino incremental."
+    else:
+        txt_treino = (
+            "\nℹ️ Modo avaliação: /confirmar NÃO está ajustando o modelo "
+            "(apenas registrando o desempenho em CSV)."
+        )
+
+    # ----------------------------------
+    # 5.1) Atualiza snapshot do melhor modelo (se houver melhoria)
+    # ----------------------------------
+    txt_best = ""
+    if TREINO_HABILITADO:
+        # Snapshot é feito ANTES de qualquer novo treino nas próximas execuções:
+        # aqui usamos o desempenho deste lote como métrica de "estado atual".
+        try:
+            if registrar_melhor_modelo(melhor_hits, media_hits):
+                txt_best = (
+                    "\n🏆 Este lote superou o melhor desempenho anterior.\n"
+                    "   Modelo atual salvo como 'lotomania_model_best.npz' "
+                    "e métricas atualizadas em 'lotomania_best_score.json'."
+                )
+        except Exception as e_best:
+            logger.exception("Erro ao registrar snapshot do melhor modelo: %s", e_best)
+            txt_best = "\n⚠️ Não foi possível salvar snapshot do melhor modelo (ver logs)."
 
     # ----------------------------------
     # 6) Resposta para o usuário
@@ -997,6 +1238,10 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     linhas.append("✅ Resultado confirmado!")
     linhas.append("Dezenas sorteadas:")
     linhas.append(" ".join(f"{d:02d}" for d in sorted(resultado)))
+    linhas.append("")
+    linhas.append(f"Melhor aposta do lote: {melhor_hits} acertos")
+    linhas.append(f"Média de acertos do lote: {media_hits:.2f}")
+    linhas.append(classe_lote)
     linhas.append("")
 
     if modo == "errar_tudo":
@@ -1033,13 +1278,26 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     linhas.append(txt_treino)
+    if txt_best:
+        linhas.append(txt_best)
 
     await update.message.reply_text("\n".join(linhas).strip())
 
 
 async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Restrito à whitelist
+    if not is_user_whitelisted(update):
+        usuario = get_user_label(update)
+        await update.message.reply_text(
+            f"⚠️ {usuario}, você não tem permissão para usar /treinar.\n"
+            "Apenas o proprietário (user_id presente em whitelist.txt) pode treinar o modelo."
+        )
+        return
+
     try:
-        await update.message.reply_text("🧠 Iniciando treinamento híbrido (CNN + MLP – modo intensivo) com o histórico...")
+        await update.message.reply_text(
+            "🧠 Iniciando treinamento híbrido (CNN + MLP – modo intensivo) com o histórico..."
+        )
 
         history = load_history(HISTORY_PATH)
 
@@ -1115,11 +1373,13 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Salva última geração para o /confirmar
         try:
+            user = update.effective_user
             dados = {
                 "timestamp": float(time.time()),
                 "modo": "oraculo",
                 "apostas": apostas_py,
                 "espelhos": espelhos_py,
+                "user_id": user.id if user else None,  # quem gerou este bloco
             }
 
             with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
@@ -1174,11 +1434,13 @@ async def errar_tudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Salva como "modo = errar_tudo" para o /confirmar
         try:
+            user = update.effective_user
             dados = {
                 "timestamp": float(time.time()),
                 "modo": "errar_tudo",
                 "apostas": apostas_py,
                 "espelhos": espelhos_py,
+                "user_id": user.id if user else None,  # quem gerou este bloco
             }
             with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
                 json.dump(dados, f, ensure_ascii=False, indent=2)
@@ -1214,7 +1476,7 @@ def main():
     app.add_handler(CommandHandler("errar_tudo", errar_tudo_cmd))
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
 
-    logger.info("Bot Lotomania (Oráculo CNN+MLP – modo intensivo) iniciado.")
+    logger.info("Bot Lotomania (Oráculo CNN+MLP – modo intensivo + whitelist) iniciado.")
     app.run_polling()
 
 
