@@ -1125,6 +1125,7 @@ def gerar_apostas_oraculo_supremo(
     return apostas, espelhos
 
 
+
 def format_dezenas_sortidas(dezenas):
     return " ".join(f"{d:02d}" for d in sorted(dezenas))
 
