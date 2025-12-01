@@ -707,14 +707,10 @@ def gerar_apostas_e_espelhos(history: List[Set[int]], model: ModelWrapper):
 def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
     """
     Modo Erro Supremo – usa a mesma base híbrida (probs + freq + atraso),
-    mas invertida para tentar maximizar o ERRO:
+    mas invertida para tentar maximizar o ERRO.
 
-      - favorece dezenas de baixa probabilidade pela rede
-      - baixa frequência recente
-      - pouco presentes em janelas mais longas
-      - com anti-overlap entre as 3 apostas de erro
-
-    Retorna 3 apostas de 50 dezenas cada.
+    Gera 3 apostas de 50 dezenas cada, usando janelas deslizantes sobre o
+    ranking de score_erro, garantindo que NENHUMA aposta venha vazia.
     """
     if len(history) < 5:
         raise ValueError("Histórico insuficiente para gerar apostas de erro.")
@@ -761,53 +757,30 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
     freq10_n = _norm(freq10)
     atraso_n = _norm(atrasos)
 
-    # ------------------------------------------------------------------
     # Score de ERRO (híbrido invertido):
     #   - (1 - probs_n): mais peso para dezenas que a rede acha ruins
     #   - (1 - freq_long_n) e (1 - freq10_n): pouco saíram
-    #   - atraso_n: um pouco de peso para as que estão sumidas
-    # ------------------------------------------------------------------
+    #   - atraso_n (opcional) pode ser somado se quiser forçar ainda mais atraso
     score_erro = (
         0.6 * (1.0 - probs_n) +
         0.2 * (1.0 - freq_long_n) +
         0.2 * (1.0 - freq10_n)
-        # opcional: + 0.1 * atraso_n  (se quiser forçar ainda mais atraso)
+        # + 0.1 * atraso_n  # se quiser enfatizar ainda mais as muito atrasadas
     )
 
     # Ordena do "melhor para errar" para o "pior para errar"
     idx_erro_desc = np.argsort(-score_erro)
 
-    apostas_erro: List[List[int]] = []
+    # 3 apostas com janelas deslizantes (sempre 50 dezenas cada)
+    aposta1 = [int(d) for d in idx_erro_desc[0:50]]
+    aposta2 = [int(d) for d in idx_erro_desc[10:60]]
+    aposta3 = [int(d) for d in idx_erro_desc[20:70]]
 
-    # Aposta erro 1: top 50 do score_erro
-    erro1 = [int(d) for d in idx_erro_desc[:50]]
-    apostas_erro.append(sorted(erro1))
-
-    # Aposta erro 2: ignora os 15 primeiros para diversificar,
-    # e evita repetir dezenas já usadas em erro1.
-    usados = set(erro1)
-    erro2 = []
-    for d in idx_erro_desc[15:]:
-        d_int = int(d)
-        if d_int in usados:
-            continue
-        erro2.append(d_int)
-        if len(erro2) == 50:
-            break
-    apostas_erro.append(sorted(erro2))
-
-    # Aposta erro 3: começa mais fundo na lista para variar ainda mais,
-    # evitando overlap com erro1 e erro2.
-    usados = usados | set(erro2)
-    erro3 = []
-    for d in idx_erro_desc[30:]:
-        d_int = int(d)
-        if d_int in usados:
-            continue
-        erro3.append(d_int)
-        if len(erro3) == 50:
-            break
-    apostas_erro.append(sorted(erro3))
+    apostas_erro: List[List[int]] = [
+        sorted(aposta1),
+        sorted(aposta2),
+        sorted(aposta3),
+    ]
 
     return apostas_erro
 
