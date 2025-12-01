@@ -706,16 +706,110 @@ def gerar_apostas_e_espelhos(history: List[Set[int]], model: ModelWrapper):
 
 def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
     """
-    Usa as MENORES probabilidades da rede para tentar errar tudo.
+    Modo Erro Supremo – usa a mesma base híbrida (probs + freq + atraso),
+    mas invertida para tentar maximizar o ERRO:
+
+      - favorece dezenas de baixa probabilidade pela rede
+      - baixa frequência recente
+      - pouco presentes em janelas mais longas
+      - com anti-overlap entre as 3 apostas de erro
+
+    Retorna 3 apostas de 50 dezenas cada.
     """
+    if len(history) < 5:
+        raise ValueError("Histórico insuficiente para gerar apostas de erro.")
+
+    # Probabilidades da rede (base)
     probs = gerar_probabilidades_para_proximo(history, model)
-    idx_sorted_asc = np.argsort(probs).tolist()
+    probs = np.clip(probs, 1e-9, None)
+    probs = probs / probs.sum()
 
-    erro1 = idx_sorted_asc[0:50]
-    erro2 = idx_sorted_asc[10:60]
-    erro3 = idx_sorted_asc[20:70]
+    n_hist = len(history)
 
-    return [erro1, erro2, erro3]
+    # Frequências em múltiplas janelas (mesma ideia do Oráculo Supremo)
+    janela_long = min(200, n_hist)
+    freq_long = np.zeros(100, dtype=np.int32)
+    for conc in history[-janela_long:]:
+        for d in conc:
+            freq_long[d] += 1
+
+    janela10 = min(10, n_hist)
+    freq10 = np.zeros(100, dtype=np.int32)
+    for conc in history[-janela10:]:
+        for d in conc:
+            freq10[d] += 1
+
+    # Atrasos
+    atrasos = np.zeros(100, dtype=np.int32)
+    for d in range(100):
+        gap = 0
+        for conc in reversed(history):
+            if d in conc:
+                break
+            gap += 1
+        atrasos[d] = gap
+
+    def _norm(arr: np.ndarray) -> np.ndarray:
+        arr = arr.astype(np.float32)
+        maxv = float(arr.max())
+        if maxv <= 0.0:
+            return np.zeros_like(arr, dtype=np.float32)
+        return arr / maxv
+
+    probs_n = _norm(probs)
+    freq_long_n = _norm(freq_long)
+    freq10_n = _norm(freq10)
+    atraso_n = _norm(atrasos)
+
+    # ------------------------------------------------------------------
+    # Score de ERRO (híbrido invertido):
+    #   - (1 - probs_n): mais peso para dezenas que a rede acha ruins
+    #   - (1 - freq_long_n) e (1 - freq10_n): pouco saíram
+    #   - atraso_n: um pouco de peso para as que estão sumidas
+    # ------------------------------------------------------------------
+    score_erro = (
+        0.6 * (1.0 - probs_n) +
+        0.2 * (1.0 - freq_long_n) +
+        0.2 * (1.0 - freq10_n)
+        # opcional: + 0.1 * atraso_n  (se quiser forçar ainda mais atraso)
+    )
+
+    # Ordena do "melhor para errar" para o "pior para errar"
+    idx_erro_desc = np.argsort(-score_erro)
+
+    apostas_erro: List[List[int]] = []
+
+    # Aposta erro 1: top 50 do score_erro
+    erro1 = [int(d) for d in idx_erro_desc[:50]]
+    apostas_erro.append(sorted(erro1))
+
+    # Aposta erro 2: ignora os 15 primeiros para diversificar,
+    # e evita repetir dezenas já usadas em erro1.
+    usados = set(erro1)
+    erro2 = []
+    for d in idx_erro_desc[15:]:
+        d_int = int(d)
+        if d_int in usados:
+            continue
+        erro2.append(d_int)
+        if len(erro2) == 50:
+            break
+    apostas_erro.append(sorted(erro2))
+
+    # Aposta erro 3: começa mais fundo na lista para variar ainda mais,
+    # evitando overlap com erro1 e erro2.
+    usados = usados | set(erro2)
+    erro3 = []
+    for d in idx_erro_desc[30:]:
+        d_int = int(d)
+        if d_int in usados:
+            continue
+        erro3.append(d_int)
+        if len(erro3) == 50:
+            break
+    apostas_erro.append(sorted(erro3))
+
+    return apostas_erro
 
 
 def treino_incremental_pos_concurso(
@@ -980,9 +1074,15 @@ def gerar_apostas_oraculo_supremo(
 
     # ====================================================
     #   APOSTA 6 – FRIAS (baixa freq + atraso alto)
-    #   Evita reuso das demais
+    #   Evita reuso das demais, com ruído leve para não "travar"
     # ====================================================
-    frias_score = 0.6 * atraso_n + 0.4 * (1.0 - freq_long_n)
+    frias_score_base = 0.6 * atraso_n + 0.4 * (1.0 - freq_long_n)
+
+    # Ruído bem leve só nas frias, para mudar um pouco a cada /gerar,
+    # sem descaracterizar o conceito de "fria".
+    ruido_frias = rng.normal(0, 0.02, size=frias_score_base.shape)
+    frias_score = frias_score_base + ruido_frias
+
     idx_frias_pool = np.argsort(frias_score)[-80:]  # maiores scores = mais "frias relevantes"
 
     usados_1a5 = usados_1a4 | set(aposta5)
