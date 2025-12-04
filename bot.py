@@ -32,8 +32,23 @@ DESEMPENHO_PATH = "desempenho_oraculo.csv"
 # Arquivo de whitelist (user_ids autorizados)
 WHITELIST_PATH = "whitelist.txt"
 
-# Flag global: se False, /confirmar só valida acertos (não treina o modelo)
-TREINO_HABILITADO = True
+# ----------------------------------------------------
+# CONFIGURAÇÃO GLOBAL DE APRENDIZADO
+# ----------------------------------------------------
+INTENSIVE_LEARNING = True  # deixar True para modo agressivo de treino
+TREINO_HABILITADO = True  # Flag global: se False, /confirmar só valida acertos (não treina o modelo)
+
+# hiperparâmetros base (modo normal)
+BASE_CONV_CHANNELS = 8
+BASE_KERNEL_SIZE = 5
+BASE_HIDDEN_DIM = 32
+BASE_LR = 0.01
+
+# hiperparâmetros reforçados (modo intensivo)
+INT_CONV_CHANNELS = 16
+INT_KERNEL_SIZE = 7
+INT_HIDDEN_DIM = 64
+INT_LR = 0.005
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -117,32 +132,39 @@ class HybridCNNMLP:
         self,
         seq_len: int,
         feat_dim: int,
-        conv_channels: int = 16,   # antes 8 → agora CNN mais forte
-        kernel_size: int = 7,      # antes 5 → kernel maior (mais contexto temporal)
-        hidden_dim: int = 64,      # antes 32 → MLP mais robusto
-        lr: float = 0.008,         # leve ajuste de learning rate para estabilidade
+        conv_channels: int | None = None,
+        kernel_size: int | None = None,
+        hidden_dim: int | None = None,
+        lr: float | None = None,
         seed: int = 42,
     ):
         self.seq_len = seq_len
         self.feat_dim = feat_dim
-        self.conv_channels = conv_channels
-        self.kernel_size = kernel_size
-        self.hidden_dim = hidden_dim
-        self.lr = lr
+
+        if INTENSIVE_LEARNING:
+            self.conv_channels = conv_channels or INT_CONV_CHANNELS
+            self.kernel_size = kernel_size or INT_KERNEL_SIZE
+            self.hidden_dim = hidden_dim or INT_HIDDEN_DIM
+            self.lr = lr or INT_LR
+        else:
+            self.conv_channels = conv_channels or BASE_CONV_CHANNELS
+            self.kernel_size = kernel_size or BASE_KERNEL_SIZE
+            self.hidden_dim = hidden_dim or BASE_HIDDEN_DIM
+            self.lr = lr or BASE_LR
 
         rng = np.random.default_rng(seed)
 
         # Convolução 1D: kernel_size x conv_channels
-        self.Wc = rng.normal(0, 0.1, size=(kernel_size, conv_channels)).astype(
+        self.Wc = rng.normal(0, 0.1, size=(self.kernel_size, self.conv_channels)).astype(
             np.float32
         )
-        self.bc = np.zeros((conv_channels,), dtype=np.float32)
+        self.bc = np.zeros((self.conv_channels,), dtype=np.float32)
 
         # MLP (entrada = features CNN + features manuais)
-        in_dim = conv_channels + feat_dim
-        self.W1 = rng.normal(0, 0.1, size=(in_dim, hidden_dim)).astype(np.float32)
-        self.b1 = np.zeros((hidden_dim,), dtype=np.float32)
-        self.W2 = rng.normal(0, 0.1, size=(hidden_dim, 1)).astype(np.float32)
+        in_dim = self.conv_channels + feat_dim
+        self.W1 = rng.normal(0, 0.1, size=(in_dim, self.hidden_dim)).astype(np.float32)
+        self.b1 = np.zeros((self.hidden_dim,), dtype=np.float32)
+        self.W2 = rng.normal(0, 0.1, size=(self.hidden_dim, 1)).astype(np.float32)
         self.b2 = np.zeros((1,), dtype=np.float32)
 
     @staticmethod
@@ -206,12 +228,15 @@ class HybridCNNMLP:
 
         N = X_ts.shape[0]
 
-        for _ in range(epochs):
+        for epoch in range(epochs):
             idx = np.arange(N)
             np.random.shuffle(idx)
             X_ts_sh = X_ts[idx]
             X_feat_sh = X_feat[idx]
             y_sh = y[idx]
+
+            total_loss = 0.0
+            n_batches = 0
 
             for start in range(0, N, batch_size):
                 end = start + batch_size
@@ -275,6 +300,15 @@ class HybridCNNMLP:
                 self.b1 -= lr * db1
                 self.Wc -= lr * dWc
                 self.bc -= lr * dbc
+
+                # Calcula loss para logging
+                loss = np.mean((y_hat - yb) ** 2)
+                total_loss += loss
+                n_batches += 1
+
+            if n_batches > 0:
+                avg_loss = total_loss / n_batches
+                logger.debug(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f}")
 
     def predict_proba(self, X_ts: np.ndarray, X_feat: np.ndarray) -> np.ndarray:
         y_hat, _ = self._forward_batch(X_ts, X_feat)
@@ -452,27 +486,38 @@ def compute_scaler(X_feat: np.ndarray):
 
 
 def save_model(wrapper: ModelWrapper, path: str = MODEL_PATH):
-    net = wrapper.net
-    np.savez(
-        path,
-        Wc=net.Wc,
-        bc=net.bc,
-        W1=net.W1,
-        b1=net.b1,
-        W2=net.W2,
-        b2=net.b2,
-        mean_feat=wrapper.mean_feat,
-        std_feat=wrapper.std_feat,
-        seq_len=np.array([wrapper.seq_len], dtype=np.int32),
-        feat_dim=np.array([net.feat_dim], dtype=np.int32),
-        conv_channels=np.array([net.conv_channels], dtype=np.int32),
-        kernel_size=np.array([net.kernel_size], dtype=np.int32),
-        hidden_dim=np.array([net.hidden_dim], dtype=np.int32),
-        lr=np.array([net.lr], dtype=np.float32),
-    )
+    """
+    Salva o modelo com todos os pesos e metadados.
+    """
+    try:
+        net = wrapper.net
+        np.savez(
+            path,
+            Wc=net.Wc,
+            bc=net.bc,
+            W1=net.W1,
+            b1=net.b1,
+            W2=net.W2,
+            b2=net.b2,
+            mean_feat=wrapper.mean_feat,
+            std_feat=wrapper.std_feat,
+            seq_len=np.array([wrapper.seq_len], dtype=np.int32),
+            feat_dim=np.array([net.feat_dim], dtype=np.int32),
+            conv_channels=np.array([net.conv_channels], dtype=np.int32),
+            kernel_size=np.array([net.kernel_size], dtype=np.int32),
+            hidden_dim=np.array([net.hidden_dim], dtype=np.int32),
+            lr=np.array([net.lr], dtype=np.float32),
+        )
+        logger.info(f"Modelo salvo em {path}")
+    except Exception as e:
+        logger.exception(f"Erro ao salvar modelo em {path}: {e}")
+        raise
 
 
 def load_model_local(path: str = MODEL_PATH) -> ModelWrapper:
+    """
+    Carrega o modelo do disco, com cache em memória.
+    """
     global _model_cache
     if _model_cache is not None:
         return _model_cache
@@ -480,48 +525,53 @@ def load_model_local(path: str = MODEL_PATH) -> ModelWrapper:
     if not os.path.exists(path):
         raise FileNotFoundError("Modelo ainda não treinado. Use /treinar.")
 
-    data = np.load(path)
+    try:
+        data = np.load(path)
 
-    # Verifica se é modelo antigo (sem Wc) e força recriação
-    if "Wc" not in data.files:
-        raise RuntimeError(
-            "Modelo salvo é de versão antiga (sem CNN). "
-            "Apague o arquivo 'lotomania_model.npz' e rode /treinar novamente."
+        # Verifica se é modelo antigo (sem Wc) e força recriação
+        if "Wc" not in data.files:
+            raise RuntimeError(
+                "Modelo salvo é de versão antiga (sem CNN). "
+                "Apague o arquivo 'lotomania_model.npz' e rode /treinar novamente."
+            )
+
+        Wc = data["Wc"]
+        bc = data["bc"]
+        W1 = data["W1"]
+        b1 = data["b1"]
+        W2 = data["W2"]
+        b2 = data["b2"]
+        mean_feat = data["mean_feat"]
+        std_feat = data["std_feat"]
+        seq_len = int(data["seq_len"][0])
+        feat_dim = int(data["feat_dim"][0])
+        conv_channels = int(data["conv_channels"][0])
+        kernel_size = int(data["kernel_size"][0])
+        hidden_dim = int(data["hidden_dim"][0])
+        lr = float(data["lr"][0])
+
+        net = HybridCNNMLP(
+            seq_len=seq_len,
+            feat_dim=feat_dim,
+            conv_channels=conv_channels,
+            kernel_size=kernel_size,
+            hidden_dim=hidden_dim,
+            lr=lr,
         )
+        net.Wc = Wc
+        net.bc = bc
+        net.W1 = W1
+        net.b1 = b1
+        net.W2 = W2
+        net.b2 = b2
 
-    Wc = data["Wc"]
-    bc = data["bc"]
-    W1 = data["W1"]
-    b1 = data["b1"]
-    W2 = data["W2"]
-    b2 = data["b2"]
-    mean_feat = data["mean_feat"]
-    std_feat = data["std_feat"]
-    seq_len = int(data["seq_len"][0])
-    feat_dim = int(data["feat_dim"][0])
-    conv_channels = int(data["conv_channels"][0])
-    kernel_size = int(data["kernel_size"][0])
-    hidden_dim = int(data["hidden_dim"][0])
-    lr = float(data["lr"][0])
-
-    net = HybridCNNMLP(
-        seq_len=seq_len,
-        feat_dim=feat_dim,
-        conv_channels=conv_channels,
-        kernel_size=kernel_size,
-        hidden_dim=hidden_dim,
-        lr=lr,
-    )
-    net.Wc = Wc
-    net.bc = bc
-    net.W1 = W1
-    net.b1 = b1
-    net.W2 = W2
-    net.b2 = b2
-
-    wrapper = ModelWrapper(net, mean_feat, std_feat, seq_len)
-    _model_cache = wrapper
-    return wrapper
+        wrapper = ModelWrapper(net, mean_feat, std_feat, seq_len)
+        _model_cache = wrapper
+        logger.info(f"Modelo carregado de {path}")
+        return wrapper
+    except Exception as e:
+        logger.exception(f"Erro ao carregar modelo de {path}: {e}")
+        raise
 
 
 # ----------------------------------------------------
@@ -786,16 +836,18 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
 
 
 def treino_incremental_pos_concurso(
-    history: List[Set[int]],
-    resultado_set: set[int],
-    epochs: int = 35,
-    batch_size: int = 64,
+    history: List[Set[int]], resultado_set: set[int]
 ):
     """
-    Treino incremental intensivo, pós-concurso:
-    - usa o ÚLTIMO ponto da linha do tempo do histórico
-    - calcula sequência + features da dezena
-    - faz um passo de treino com o resultado confirmado
+    Treino incremental pós-concurso:
+
+    MODO NORMAL:
+      - usa apenas o último ponto da linha do tempo
+
+    MODO INTENSIVO:
+      - usa uma janela de vários concursos (por ex. últimos 30)
+      - mais épocas
+      - batch menor para gradiente mais "fino"
     """
     try:
         wrapper = load_model_local()
@@ -812,18 +864,33 @@ def treino_incremental_pos_concurso(
 
     seq_len = wrapper.seq_len
     net = wrapper.net
-    idx = len(history) - 1  # último concurso do histórico
+
+    # ------------------------------------------------
+    # DEFINIÇÃO DA JANELA TEMPORAL PARA INTENSIVO
+    # ------------------------------------------------
+    if INTENSIVE_LEARNING:
+        # usa até os últimos 30 concursos como base
+        janela_treino = 30
+        idx_final = len(history) - 1
+        idx_inicio = max(seq_len - 1, idx_final - janela_treino + 1)
+        indices_base = range(idx_inicio, idx_final + 1)
+    else:
+        # comportamento antigo: só o último concurso
+        indices_base = [len(history) - 1]
 
     X_ts_list = []
     X_feat_list = []
     y_list = []
 
-    for dezena in range(100):
-        ts = compute_ts_for_dozen(history, idx, dezena, seq_len)
-        feats = compute_features_for_dozen(history, idx, dezena)
-        X_ts_list.append(ts)
-        X_feat_list.append(feats)
-        y_list.append(1 if dezena in resultado_set else 0)
+    for idx in indices_base:
+        for dezena in range(100):
+            ts = compute_ts_for_dozen(history, idx, dezena, seq_len)
+            feats = compute_features_for_dozen(history, idx, dezena)
+            X_ts_list.append(ts)
+            X_feat_list.append(feats)
+
+            # o target sempre é o resultado_set do concurso recém-confirmado
+            y_list.append(1 if dezena in resultado_set else 0)
 
     X_ts = np.array(X_ts_list, dtype=np.float32)
     X_feat = np.array(X_feat_list, dtype=np.float32)
@@ -832,7 +899,17 @@ def treino_incremental_pos_concurso(
     # scaler já existente
     X_feat_scaled = (X_feat - wrapper.mean_feat) / wrapper.std_feat
 
-    net.fit(X_ts, X_feat_scaled, y, epochs=epochs, batch_size=batch_size)
+    # ------------------------------------------------
+    # HIPERPARÂMETROS DE TREINO INCREMENTAL
+    # ------------------------------------------------
+    if INTENSIVE_LEARNING:
+        epocas = 80
+        batch = 256
+    else:
+        epocas = 10
+        batch = 100
+
+    net.fit(X_ts, X_feat_scaled, y, epochs=epocas, batch_size=batch)
 
     # salva e atualiza cache
     save_model(wrapper)
@@ -840,10 +917,10 @@ def treino_incremental_pos_concurso(
     _model_cache = wrapper
 
     logger.info(
-        "Treino incremental pós-concurso concluído (modo intensivo CNN+MLP). "
-        "epochs=%d batch_size=%d",
-        epochs,
-        batch_size,
+        "Treino incremental pós-concurso concluído (modo %s, amostras=%d, épocas=%d).",
+        "INTENSIVO" if INTENSIVE_LEARNING else "NORMAL",
+        len(y),
+        epocas,
     )
 
 
@@ -1143,7 +1220,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/confirmar - confronta o resultado oficial com o último bloco gerado, "
         "registra desempenho e, se habilitado, aplica treino incremental (RESTRITO à whitelist)\n\n"
         "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado.\n"
-        f"Modo treino habilitado: {'SIM' if TREINO_HABILITADO else 'NÃO (apenas avaliação)'}"
+        f"Modo treino habilitado: {'SIM' if TREINO_HABILITADO else 'NÃO (apenas avaliação)'}\n"
+        f"Modo intensivo: {'ATIVADO' if INTENSIVE_LEARNING else 'DESATIVADO'}"
     )
     await update.message.reply_text(msg)
 
@@ -1305,7 +1383,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         epochs_inc = 20
     elif melhor_hits >= 11:
-        classe_lote = "Lote forte — reforço mais intenso aplicado nas dezenas-chave."
+        classe_lote = "Lote forte — reforço mais intensivo aplicado nas dezenas-chave."
         epochs_inc = 28
     elif melhor_hits >= 9:
         classe_lote = "Lote mediano — ajuste normal aplicado."
@@ -1377,17 +1455,13 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if history is not None:
             try:
-                treino_incremental_pos_concurso(
-                    history,
-                    resultado_set,
-                    epochs=epochs_inc,
-                    batch_size=64,
-                )
+                # Chama a NOVA função de treino incremental (modo intensivo)
+                treino_incremental_pos_concurso(history, resultado_set)
                 txt_treino = (
                     f"\n🧠 Treino incremental INTENSIVO aplicado ao modelo (CNN+MLP).\n"
                     f"   • Melhor aposta do lote: {melhor_hits} acertos\n"
                     f"   • Média do lote: {media_hits:.2f} acertos\n"
-                    f"   • Intensidade de treino usada: {epochs_inc} epochs (modo online)"
+                    f"   • Modo: {'INTENSIVO (80 épocas, janela 30 concursos)' if INTENSIVE_LEARNING else 'NORMAL (10 épocas, último concurso)'}"
                 )
             except Exception as e_inc:
                 logger.exception("Erro no treino incremental pós-concurso: %s", e_inc)
@@ -1486,6 +1560,9 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Treinamento completo do modelo híbrido CNN+MLP.
+    """
     # Restrito à whitelist
     if not is_user_whitelisted(update):
         usuario = get_user_label(update)
@@ -1496,26 +1573,26 @@ async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        modo_txt = "INTENSIVO" if INTENSIVE_LEARNING else "normal"
         await update.message.reply_text(
-            "🧠 Iniciando treinamento híbrido (CNN + MLP – modo intensivo) com o histórico..."
+            f"🧠 Iniciando treinamento híbrido (CNN + MLP) – modo {modo_txt} – com o histórico..."
         )
 
         history = load_history(HISTORY_PATH)
 
-        # seq_len mais longo para capturar mais contexto temporal
-        seq_len_default = 60
+        # seq_len padrão um pouco maior em modo intensivo
+        seq_len_default = 60 if INTENSIVE_LEARNING else 40
 
-        # Tenta reaproveitar modelo existente (mesmo seq_len)
         wrapper_antigo = None
         seq_len = min(seq_len_default, len(history) - 1)
 
         try:
             wrapper_antigo = load_model_local()
+            # se já existe, mantemos o seq_len antigo pra não quebrar compatibilidade
             seq_len = wrapper_antigo.seq_len
         except FileNotFoundError:
             wrapper_antigo = None
         except RuntimeError as e_incompat:
-            # Modelo antigo (sem CNN) → ignora e treina do zero
             logger.warning(str(e_incompat))
             wrapper_antigo = None
         except Exception as e:
@@ -1531,18 +1608,20 @@ async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if wrapper_antigo is not None:
             net = wrapper_antigo.net
         else:
-            # CNN mais forte + MLP maior em modo intensivo
             net = HybridCNNMLP(
                 seq_len=seq_len,
                 feat_dim=feat_dim,
-                conv_channels=16,
-                kernel_size=7,
-                hidden_dim=64,
-                lr=0.008,
             )
 
-        # TREINO INTENSIVO GLOBAL
-        net.fit(X_ts, X_feat_scaled, y, epochs=100, batch_size=512)
+        # mais épocas em modo intensivo
+        if INTENSIVE_LEARNING:
+            epocas = 120
+            batch = 512
+        else:
+            epocas = 60
+            batch = 512
+
+        net.fit(X_ts, X_feat_scaled, y, epochs=epocas, batch_size=batch)
 
         wrapper = ModelWrapper(net, mean_feat, std_feat, seq_len)
         save_model(wrapper)
@@ -1550,9 +1629,10 @@ async def treinar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _model_cache = wrapper
 
         await update.message.reply_text(
-            f"✅ Treinamento concluído (híbrido CNN+MLP – modo intensivo).\n"
+            "✅ Treinamento concluído (híbrido CNN+MLP).\n"
             f"Amostras usadas: {len(y)}\n"
-            f"seq_len = {seq_len}"
+            f"seq_len = {seq_len}\n"
+            f"épocas = {epocas} (modo {modo_txt})"
         )
 
     except Exception as e:
