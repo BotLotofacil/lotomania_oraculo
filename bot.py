@@ -6,7 +6,8 @@ import os
 import csv
 import logging
 import shutil
-from typing import List, Set
+from typing import List, Set, Tuple
+from datetime import datetime
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -136,7 +137,7 @@ class HybridCNNMLP:
         kernel_size: int | None = None,
         hidden_dim: int | None = None,
         lr: float | None = None,
-        seed: int = 42,
+        seed: int = None,
     ):
         self.seq_len = seq_len
         self.feat_dim = feat_dim
@@ -152,6 +153,9 @@ class HybridCNNMLP:
             self.hidden_dim = hidden_dim or BASE_HIDDEN_DIM
             self.lr = lr or BASE_LR
 
+        # Usa seed baseada no tempo atual para variar a cada execução
+        if seed is None:
+            seed = int(time.time() * 1000) % 1000000
         rng = np.random.default_rng(seed)
 
         # Convolução 1D: kernel_size x conv_channels
@@ -754,25 +758,38 @@ def gerar_apostas_e_espelhos(history: List[Set[int]], model: ModelWrapper):
     return apostas, espelhos
 
 
-def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
+def gerar_apostas_errar_tudo_melhorado(
+    history: List[Set[int]], model: ModelWrapper
+) -> Tuple[List[List[int]], List[List[int]]]:
     """
-    Modo Erro Supremo – usa a mesma base híbrida (probs + freq + atraso),
-    mas invertida para tentar maximizar o ERRO.
-
-    Gera 3 apostas de 50 dezenas cada, usando janelas deslizantes sobre o
-    ranking de score_erro, garantindo que NENHUMA aposta venha vazia.
+    Versão MELHORADA do modo Erro Supremo - com mais variação e inteligência.
+    
+    Gera 3 apostas diversificadas:
+    1. Probabilística invertida (menor probabilidade)
+    2. Híbrida de baixa frequência
+    3. Dezenas "frias" inteligentes
+    
+    Retorna: (apostas, espelhos)
     """
     if len(history) < 5:
         raise ValueError("Histórico insuficiente para gerar apostas de erro.")
 
-    # Probabilidades da rede (base)
+    # Carrega probabilidades da rede
     probs = gerar_probabilidades_para_proximo(history, model)
     probs = np.clip(probs, 1e-9, None)
     probs = probs / probs.sum()
 
     n_hist = len(history)
+    
+    # Gera ruído diferente a cada execução
+    seed = int(time.time() * 1000) % 1000000
+    rng = np.random.default_rng(seed)
 
-    # Frequências em múltiplas janelas (mesma ideia do Oráculo Supremo)
+    # ====================================================
+    #   CÁLCULO DE FEATURES DINÂMICAS
+    # ====================================================
+    
+    # Frequências em múltiplas janelas
     janela_long = min(200, n_hist)
     freq_long = np.zeros(100, dtype=np.int32)
     for conc in history[-janela_long:]:
@@ -785,6 +802,12 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
         for d in conc:
             freq10[d] += 1
 
+    janela30 = min(30, n_hist)
+    freq30 = np.zeros(100, dtype=np.int32)
+    for conc in history[-janela30:]:
+        for d in conc:
+            freq30[d] += 1
+
     # Atrasos
     atrasos = np.zeros(100, dtype=np.int32)
     for d in range(100):
@@ -795,6 +818,9 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
             gap += 1
         atrasos[d] = gap
 
+    # ====================================================
+    #   NORMALIZAÇÃO DAS FEATURES
+    # ====================================================
     def _norm(arr: np.ndarray) -> np.ndarray:
         arr = arr.astype(np.float32)
         maxv = float(arr.max())
@@ -805,34 +831,50 @@ def gerar_apostas_errar_tudo(history: List[Set[int]], model: ModelWrapper):
     probs_n = _norm(probs)
     freq_long_n = _norm(freq_long)
     freq10_n = _norm(freq10)
+    freq30_n = _norm(freq30)
     atraso_n = _norm(atrasos)
 
-    # Score de ERRO (híbrido invertido):
-    #   - (1 - probs_n): mais peso para dezenas que a rede acha ruins
-    #   - (1 - freq_long_n) e (1 - freq10_n): pouco saíram
-    #   - atraso_n (opcional) pode ser somado se quiser forçar ainda mais atraso
-    score_erro = (
-        0.6 * (1.0 - probs_n) +
-        0.2 * (1.0 - freq_long_n) +
-        0.2 * (1.0 - freq10_n)
-        # + 0.1 * atraso_n  # se quiser enfatizar ainda mais as muito atrasadas
-    )
+    # ====================================================
+    #   SCORES DIVERSIFICADOS PARA CADA APOSTA
+    # ====================================================
+    
+    # APOSTA 1: PROBABILÍSTICA INVERTIDA (menor probabilidade)
+    # Adiciona ruído para variar a cada execução
+    ruido1 = rng.normal(0, 0.15, size=probs_n.shape)
+    score_erro1 = (1.0 - probs_n) * 0.7 + (1.0 - freq_long_n) * 0.2 + atraso_n * 0.1 + ruido1 * 0.3
+    
+    # APOSTA 2: HÍBRIDA DE BAIXA FREQUÊNCIA
+    ruido2 = rng.normal(0, 0.12, size=probs_n.shape)
+    score_erro2 = (1.0 - probs_n) * 0.4 + (1.0 - freq30_n) * 0.4 + atraso_n * 0.2 + ruido2 * 0.2
+    
+    # APOSTA 3: DEZENAS "FRIAS" INTELIGENTES
+    ruido3 = rng.normal(0, 0.1, size=probs_n.shape)
+    score_erro3 = atraso_n * 0.6 + (1.0 - freq10_n) * 0.3 + (1.0 - probs_n) * 0.1 + ruido3 * 0.2
 
-    # Ordena do "melhor para errar" para o "pior para errar"
-    idx_erro_desc = np.argsort(-score_erro)
+    # ====================================================
+    #   SELEÇÃO DAS DEZENAS
+    # ====================================================
+    
+    def selecionar_dezenas(score: np.ndarray, n_dezenas: int = 50) -> List[int]:
+        """Seleciona as n_dezenas com maior score (mais propensas a errar)."""
+        idx_ordenados = np.argsort(-score)  # ordena decrescente
+        return [int(d) for d in idx_ordenados[:n_dezenas]]
 
-    # 3 apostas com janelas deslizantes (sempre 50 dezenas cada)
-    aposta1 = [int(d) for d in idx_erro_desc[0:50]]
-    aposta2 = [int(d) for d in idx_erro_desc[10:60]]
-    aposta3 = [int(d) for d in idx_erro_desc[20:70]]
+    # Gera as 3 apostas
+    aposta1 = sorted(selecionar_dezenas(score_erro1))
+    aposta2 = sorted(selecionar_dezenas(score_erro2))
+    aposta3 = sorted(selecionar_dezenas(score_erro3))
 
-    apostas_erro: List[List[int]] = [
-        sorted(aposta1),
-        sorted(aposta2),
-        sorted(aposta3),
-    ]
+    apostas_erro = [aposta1, aposta2, aposta3]
 
-    return apostas_erro
+    # ====================================================
+    #   GERA ESPELHOS
+    # ====================================================
+    universo = set(range(100))
+    espelhos_erro = [sorted(list(universo - set(ap))) for ap in apostas_erro]
+
+    logger.info(f"Geradas apostas 'errar_tudo' melhoradas (seed: {seed})")
+    return apostas_erro, espelhos_erro
 
 
 def treino_incremental_pos_concurso(
@@ -991,7 +1033,8 @@ def gerar_apostas_oraculo_supremo(
     # ====================================================
     #   RUÍDO ADAPTATIVO – muda A CADA EXECUÇÃO
     # ====================================================
-    rng = np.random.default_rng()
+    seed = int(time.time() * 1000) % 1000000
+    rng = np.random.default_rng(seed)
     ruido = rng.normal(0, 0.08, size=probs.shape)  # ruído um pouco maior p/ variar mais
     probs_ruido = probs + ruido
     probs_ruido = np.clip(probs_ruido, 1e-9, None)
@@ -1216,14 +1259,215 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/treinar - treina ou atualiza a rede neural híbrida (treino forte) "
         "(RESTRITO à whitelist)\n"
         "/gerar - Oráculo Supremo (6 apostas + 6 espelhos)\n"
-        "/errar_tudo - gera 3 apostas tentando errar tudo\n"
+        "/errar_tudo - gera 3 apostas tentando errar tudo (versão melhorada)\n"
         "/confirmar - confronta o resultado oficial com o último bloco gerado, "
-        "registra desempenho e, se habilitado, aplica treino incremental (RESTRITO à whitelist)\n\n"
+        "registra desempenho e, se habilitado, aplica treino incremental (RESTRITO à whitelist)\n"
+        "/avaliar - apenas confirma os acertos das apostas (SEM treinar o modelo)\n\n"
         "Mantenha o arquivo lotomania_historico_onehot.csv sempre atualizado.\n"
         f"Modo treino habilitado: {'SIM' if TREINO_HABILITADO else 'NÃO (apenas avaliação)'}\n"
         f"Modo intensivo: {'ATIVADO' if INTENSIVE_LEARNING else 'DESATIVADO'}"
     )
     await update.message.reply_text(msg)
+
+
+async def avaliar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /avaliar 02 08 15 20 24 25 30 34 37 40 43 51 60 62 67 77 81 85 87 94
+    
+    Apenas confirma os acertos das apostas SEM treinar o modelo.
+    Ideal para testar estratégias sem afetar o aprendizado.
+    """
+    texto = (update.message.text or "").strip()
+    partes = texto.split()
+
+    if len(partes) < 21:
+        await update.message.reply_text(
+            "❌ Uso correto:\n"
+            "/avaliar 02 08 15 20 24 25 30 34 37 40 43 51 60 62 67 77 81 85 87 94"
+        )
+        return
+
+    # ----------------------------------
+    # 1) Parse do resultado oficial
+    # ----------------------------------
+    try:
+        dezenas_str = partes[1:]
+        dezenas_int = [int(d) for d in dezenas_str]
+
+        # filtra duplicadas e valida faixa
+        resultado = []
+        for d in dezenas_int:
+            if 0 <= d <= 99 and d not in resultado:
+                resultado.append(d)
+
+        if len(resultado) != 20:
+            await update.message.reply_text(
+                f"❌ Informe exatamente 20 dezenas válidas (00–99). Recebi {len(resultado)}."
+            )
+            return
+
+        resultado_set = set(resultado)
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Não consegui interpretar as dezenas. Use apenas números separados por espaço."
+        )
+        return
+
+    # ----------------------------------
+    # 2) Carrega última geração
+    # ----------------------------------
+    if not os.path.exists(ULTIMA_GERACAO_PATH):
+        await update.message.reply_text(
+            "⚠️ Arquivo de última geração não encontrado.\n"
+            "Gere um novo bloco com /gerar ou /errar_tudo e depois use /avaliar."
+        )
+        return
+
+    try:
+        with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+
+        apostas = dados.get("apostas")
+        espelhos = dados.get("espelhos")
+        modo = dados.get("modo", "oraculo")  # "oraculo" ou "errar_tudo"
+
+        if not apostas or not espelhos:
+            raise ValueError("Dados incompletos na última geração.")
+
+        # garante int nativo
+        apostas_py = [[int(x) for x in ap] for ap in apostas]
+        espelhos_py = [[int(x) for x in esp] for esp in espelhos]
+
+    except Exception:
+        logger.exception("Erro ao ler arquivo de última geração.")
+        await update.message.reply_text(
+            "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
+            "Use /gerar ou /errar_tudo novamente para criar um novo bloco."
+        )
+        return
+
+    # ----------------------------------
+    # 3) Calcula acertos por aposta/espelho
+    # ----------------------------------
+    hits_apostas = []
+    hits_espelhos = []
+
+    for ap, esp in zip(apostas_py, espelhos_py):
+        hits_apostas.append(len(resultado_set.intersection(ap)))
+        hits_espelhos.append(len(resultado_set.intersection(esp)))
+
+    n_apostas = len(hits_apostas)
+    n_esp = len(hits_espelhos)
+
+    if n_apostas == 0:
+        await update.message.reply_text("⚠️ Não há apostas válidas na última geração.")
+        return
+
+    melhor_ap_idx = int(np.argmax(hits_apostas))  # 0..n-1
+    melhor_esp_idx = int(np.argmax(hits_espelhos))
+
+    melhor_hits = int(hits_apostas[melhor_ap_idx])
+    media_hits = float(sum(hits_apostas) / n_apostas)
+
+    # ----------------------------------
+    # 4) Salva histórico de acertos em CSV (apenas para registro)
+    # ----------------------------------
+    try:
+        existe = os.path.exists(DESEMPENHO_PATH)
+        with open(DESEMPENHO_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=";")
+
+            if not existe:
+                header = [
+                    "timestamp",
+                    "resultado",
+                    "acertos_ap1", "acertos_ap2", "acertos_ap3",
+                    "acertos_ap4", "acertos_ap5", "acertos_ap6",
+                    "acertos_esp1", "acertos_esp2", "acertos_esp3",
+                    "acertos_esp4", "acertos_esp5", "acertos_esp6",
+                    "melhor_aposta", "melhor_espelho",
+                    "modo",
+                    "melhor_hits", "media_hits",
+                    "tipo_confirma",  # novo campo
+                ]
+                writer.writerow(header)
+
+            ts = time.time()
+            resultado_txt = " ".join(f"{d:02d}" for d in sorted(resultado))
+
+            # Padding para sempre ter 6 posições
+            ha = (hits_apostas + [0] * 6)[:6]
+            he = (hits_espelhos + [0] * 6)[:6]
+
+            row = [
+                f"{ts:.3f}",
+                resultado_txt,
+                *[int(h) for h in ha],
+                *[int(h) for h in he],
+                melhor_ap_idx + 1,
+                melhor_esp_idx + 1,
+                modo,
+                melhor_hits,
+                f"{media_hits:.2f}",
+                "avaliar",  # tipo de confirmação
+            ]
+            writer.writerow(row)
+
+        logger.info(f"Desempenho registrado (apenas avaliação) em {DESEMPENHO_PATH}")
+
+    except Exception as e_csv:
+        logger.exception("Erro ao salvar desempenho em CSV: %s", e_csv)
+
+    # ----------------------------------
+    # 5) Resposta para o usuário
+    # ----------------------------------
+    linhas = []
+    linhas.append("📊 Avaliação de Desempenho (SEM treino)")
+    linhas.append("Dezenas sorteadas:")
+    linhas.append(" ".join(f"{d:02d}" for d in sorted(resultado)))
+    linhas.append("")
+    linhas.append(f"Melhor aposta do lote: {melhor_hits} acertos")
+    linhas.append(f"Média de acertos do lote: {media_hits:.2f}")
+    linhas.append("")
+
+    if modo == "errar_tudo":
+        labels = [f"Aposta erro {i}" for i in range(1, n_apostas + 1)]
+    else:
+        labels = [
+            "Aposta 1 – Repetição",
+            "Aposta 2 – Ciclos",
+            "Aposta 3 – Probabilística",
+            "Aposta 4 – Híbrida",
+            "Aposta 5 – Dezenas quentes",
+            "Aposta 6 – Dezenas frias",
+        ]
+        labels = labels[:n_apostas]
+
+    for i in range(n_apostas):
+        linhas.append(f"{labels[i]}: {hits_apostas[i]} acertos")
+        linhas.append(f"Espelho {i+1}: {hits_espelhos[i]} acertos")
+        linhas.append("")
+
+    if modo == "errar_tudo":
+        linhas.append(
+            f"🏅 Melhor aposta erro: Aposta erro {melhor_ap_idx+1} ({hits_apostas[melhor_ap_idx]} pontos)"
+        )
+        linhas.append(
+            f"🏅 Melhor espelho erro: Espelho erro {melhor_esp_idx+1} ({hits_espelhos[melhor_esp_idx]} pontos)"
+        )
+    else:
+        linhas.append(
+            f"🏅 Melhor aposta: {labels[melhor_ap_idx]} ({hits_apostas[melhor_ap_idx]} pontos)"
+        )
+        linhas.append(
+            f"🏅 Melhor espelho: Espelho {melhor_esp_idx+1} ({hits_espelhos[melhor_esp_idx]} pontos)"
+        )
+
+    linhas.append("\nℹ️ Este comando apenas avalia os acertos, SEM alterar o modelo.")
+    linhas.append("Use /confirmar para treinar o modelo com este resultado.")
+
+    await update.message.reply_text("\n".join(linhas).strip())
 
 
 async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1411,6 +1655,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "melhor_aposta", "melhor_espelho",
                     "modo",
                     "melhor_hits", "media_hits",
+                    "tipo_confirma",
                 ]
                 writer.writerow(header)
 
@@ -1431,6 +1676,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 modo,
                 melhor_hits,
                 f"{media_hits:.2f}",
+                "confirmar",
             ]
             writer.writerow(row)
 
@@ -1703,11 +1949,8 @@ async def errar_tudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = load_history(HISTORY_PATH)
         model = load_model_local()
 
-        apostas_erro = gerar_apostas_errar_tudo(history, model)
-
-        # Cria espelhos também para errar_tudo
-        universo = set(range(100))
-        espelhos_erro = [sorted(list(universo - set(ap))) for ap in apostas_erro]
+        # Usa a versão MELHORADA do errar_tudo
+        apostas_erro, espelhos_erro = gerar_apostas_errar_tudo_melhorado(history, model)
 
         # CONVERTE para int nativo
         apostas_py = [[int(x) for x in ap] for ap in apostas_erro]
@@ -1728,9 +1971,17 @@ async def errar_tudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e_save:
             logger.exception(f"Erro ao salvar última geração (errar_tudo): {e_save}")
 
-        linhas = ["🙃 Apostas para tentar errar tudo\n"]
-        for i, ap in enumerate(apostas_py, start=1):
-            linhas.append(f"Aposta erro {i}: {format_dezenas_sortidas(ap)}")
+        linhas = ["🙃 Apostas para tentar errar tudo (VERSÃO MELHORADA)\n"]
+        linhas.append("Aposta 1 – Probabilística invertida (menor probabilidade):")
+        linhas.append(format_dezenas_sortidas(apostas_py[0]))
+        linhas.append("")
+        linhas.append("Aposta 2 – Híbrida de baixa frequência:")
+        linhas.append(format_dezenas_sortidas(apostas_py[1]))
+        linhas.append("")
+        linhas.append("Aposta 3 – Dezenas 'frias' inteligentes:")
+        linhas.append(format_dezenas_sortidas(apostas_py[2]))
+        linhas.append("")
+        linhas.append("ℹ️ As apostas agora variam a cada execução com base em múltiplos fatores.")
 
         await update.message.reply_text("\n".join(linhas))
 
@@ -1756,8 +2007,10 @@ def main():
     app.add_handler(CommandHandler("gerar", gerar_cmd))
     app.add_handler(CommandHandler("errar_tudo", errar_tudo_cmd))
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
+    app.add_handler(CommandHandler("avaliar", avaliar_cmd))
 
     logger.info("Bot Lotomania (Oráculo CNN+MLP – modo intensivo + whitelist + 70/30 campeão) iniciado.")
+    logger.info("Novos comandos: /avaliar (apenas avalia acertos sem treinar)")
     app.run_polling()
 
 
