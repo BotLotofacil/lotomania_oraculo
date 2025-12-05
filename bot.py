@@ -1403,101 +1403,31 @@ def selecionar_dezenas_refino_corrigido(
     
     return sorted(selecionadas)
 
+
 def gerar_apostas_refino(
     history: List[Set[int]], model: ModelWrapper
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
-    COMANDO /refino - VERSÃO ULTRA-EFICIENTE CORRIGIDA
-    
-    Combina TUDO que aprendemos:
-    1. Penalidades exponenciais para sequências
-    2. Blacklist automática para dezenas persistentes
-    3. Otimização para espelhos
-    4. Diversificação garantida
-    5. Adaptação dinâmica
-    
+    COMANDO /refino - VERSÃO ULTRA-EFICIENTE REFEITA
+
+    Ideia central:
+    - Usa histórico + penalidades (aprendizado) para ranquear as dezenas
+    - Cria um NÚCLEO de dezenas principais (fixas em todas as apostas)
+    - Cria dezenas secundárias que GIRAM entre as 3 apostas
+    - Cada /refino gera variações, mas mantém a espinha dorsal
+
     Retorna: (apostas, espelhos)
     """
     if len(history) < 5:
         raise ValueError("Histórico insuficiente para gerar apostas de refino.")
-    
-    logger.info("=== INICIANDO /REFINO CORRIGIDO ===")
-    
-    # ====================================================
-    #   ANÁLISE DETALHADA DO HISTÓRICO RECENTE
-    # ====================================================
-    
-    # Últimos 5 concursos para análise
-    ultimos_5 = history[-5:] if len(history) >= 5 else history
-    
-    # Dezenas que mais aparecem nos últimos 5
-    freq_ultimos_5 = np.zeros(100, dtype=np.int32)
-    for conc in ultimos_5:
-        for d in conc:
-            freq_ultimos_5[d] += 1
-    
-    # Identifica DEZENAS PERIGOSAS (que saíram 3+ vezes nos últimos 5)
-    dezenas_perigosas = set()
-    for d in range(100):
-        if freq_ultimos_5[d] >= 3:
-            dezenas_perigosas.add(d)
-    
-    logger.info(f"Dezenas perigosas detectadas: {sorted(dezenas_perigosas)}")
-    
-    # Identifica DEZENAS EM SEQUÊNCIA (saíram nos últimos 2+ concursos)
-    dezenas_em_sequencia = set()
-    if len(history) >= 2:
-        ultimo = history[-1]
-        penultimo = history[-2] if len(history) >= 2 else set()
-        dezenas_em_sequencia = ultimo.intersection(penultimo)
-    
-    logger.info(f"Dezenas em sequência: {sorted(dezenas_em_sequencia)}")
-    
-    # ====================================================
-    #   PENALIDADES EXPONENCIAIS
-    # ====================================================
-    
-    penalidades = carregar_penalidades()
-    
-    # Aplica penalidades exponenciais para sequências
-    penalidades_refino = defaultdict(float)
-    
-    for dezena in range(100):
-        # Penalidade acumulada normal
-        penalidade_acumulada = penalidades.get(dezena, 0.0)
-        
-        # Penalidade extra por ser perigosa
-        if dezena in dezenas_perigosas:
-            fator_perigo = min(5.0, 1.0 + (freq_ultimos_5[dezena] * 0.8))
-            penalidade_acumulada *= fator_perigo
-        
-        # Penalidade EXTRA por estar em sequência
-        if dezena in dezenas_em_sequencia:
-            penalidade_acumulada += 5.0  # Penalidade pesada REFORÇADA
-        
-        penalidades_refino[dezena] = penalidade_acumulada
-    
-    # ====================================================
-    #   PROBABILIDADES DA REDE (com ajustes)
-    # ====================================================
-    
-    probs = gerar_probabilidades_para_proximo(history, model)
-    probs = np.clip(probs, 1e-9, None)
-    
-    # Ajusta probabilidades com penalidades
-    for dezena in range(100):
-        ajuste = penalidades_refino[dezena]
-        # Para /refino (tentar errar), penalidades POSITIVAS aumentam a chance de escolha
-        probs[dezena] *= (1.0 + ajuste * 0.3)
-    
-    probs = probs / probs.sum()
-    
-    # ====================================================
-    #   FEATURES AVANÇADAS
-    # ====================================================
-    
+
+    logger.info("=== INICIANDO /REFINO (NOVA LÓGICA) ===")
+
+    # ----------------------------------------------------
+    # 1) ANÁLISE BÁSICA DO HISTÓRICO E PENALIDADES
+    # ----------------------------------------------------
     n_hist = len(history)
-    
+
     # Atrasos
     atrasos = np.zeros(100, dtype=np.int32)
     for d in range(100):
@@ -1507,16 +1437,16 @@ def gerar_apostas_refino(
                 break
             gap += 1
         atrasos[d] = gap
-    
-    # Frequência em janelas estratégicas
+
+    # Frequências em janelas
     janela_curta = min(8, n_hist)
     janela_media = min(20, n_hist)
     janela_longa = min(50, n_hist)
-    
+
     freq_curta = np.zeros(100, dtype=np.int32)
     freq_media = np.zeros(100, dtype=np.int32)
     freq_longa = np.zeros(100, dtype=np.int32)
-    
+
     for i, conc in enumerate(reversed(history)):
         if i < janela_curta:
             for d in conc:
@@ -1527,198 +1457,191 @@ def gerar_apostas_refino(
         if i < janela_longa:
             for d in conc:
                 freq_longa[d] += 1
-    
-    # ====================================================
-    #   NORMALIZAÇÃO
-    # ====================================================
-    
+
+    # Probabilidades do modelo
+    probs = gerar_probabilidades_para_proximo(history, model)
+    probs = np.clip(probs, 1e-9, None)
+
+    # Penalidades aprendidas
+    penalidades = carregar_penalidades()
+    penal_array = np.zeros(100, dtype=np.float32)
+    for d, v in penalidades.items():
+        penal_array[d] = float(v)
+
+    # Dezenas perigosas e em sequência (últimos concursos)
+    ultimos_5 = history[-5:] if len(history) >= 5 else history
+    freq_ultimos_5 = np.zeros(100, dtype=np.int32)
+    for conc in ultimos_5:
+        for d in conc:
+            freq_ultimos_5[d] += 1
+
+    dezenas_perigosas = {d for d in range(100) if freq_ultimos_5[d] >= 3}
+
+    dezenas_em_sequencia = set()
+    if len(history) >= 2:
+        ultimo = history[-1]
+        penultimo = history[-2]
+        dezenas_em_sequencia = ultimo.intersection(penultimo)
+
+    logger.info(f"Dezenas perigosas: {sorted(dezenas_perigosas)}")
+    logger.info(f"Dezenas em sequência: {sorted(dezenas_em_sequencia)}")
+
+    # ----------------------------------------------------
+    # 2) NORMALIZAÇÃO
+    # ----------------------------------------------------
     def _norm(arr: np.ndarray) -> np.ndarray:
         arr = arr.astype(np.float32)
         maxv = float(arr.max())
         if maxv <= 0.0:
             return np.zeros_like(arr, dtype=np.float32)
         return arr / maxv
-    
-    probs_n = _norm(probs)
+
     atraso_n = _norm(atrasos)
     freq_curta_n = _norm(freq_curta)
     freq_media_n = _norm(freq_media)
     freq_longa_n = _norm(freq_longa)
-    
-    # Penalidades normalizadas
-    penalidades_array = np.zeros(100, dtype=np.float32)
-    for dezena, valor in penalidades_refino.items():
-        penalidades_array[dezena] = valor
-    penalidades_n = _norm(penalidades_array)
-    
-    # ====================================================
-    #   ESTRATÉGIAS DIVERSIFICADAS PARA /REFINO
-    # ====================================================
-    
+    probs_n = _norm(probs)
+    penal_n = _norm(penal_array)
+
+    # ----------------------------------------------------
+    # 3) SCORE GLOBAL (APRENDIZADO REAL)
+    # ----------------------------------------------------
+    # Score alto = dezena "interessante" para aparecer nas apostas de refino.
+    # Ajuste de pesos pode ser afinado depois dos resultados reais.
+    base_score = (
+        (1.0 - penal_n) * 0.35  # menos penalizada pelo aprendizado
+        + atraso_n * 0.25       # mais atrasada
+        + (1.0 - freq_curta_n) * 0.15  # pouco usada recentemente
+        + (1.0 - freq_media_n) * 0.10  # pouco usada na janela média
+        + (1.0 - probs_n) * 0.15       # baixa probabilidade da rede
+    )
+
+    # Dezenas perigosas e em sequência recebem queda de score
+    for d in dezenas_perigosas:
+        base_score[d] -= 0.5
+    for d in dezenas_em_sequencia:
+        base_score[d] -= 0.3
+
+    # Ranking global
+    ranking = list(np.argsort(-base_score))  # ordem decrescente
+
+    # ----------------------------------------------------
+    # 4) DEFINIÇÃO DO NÚCLEO E DAS FLEX
+    # ----------------------------------------------------
+    # Núcleo fixo: sempre presente nas 3 apostas
+    # Núcleo variável: gira entre as 3 apostas de forma diferente
+    # Flex: completa para 50 dezenas, girando mais agressivamente
+
     seed = int(time.time() * 1000) % 1000000
     rng = np.random.default_rng(seed)
-    logger.info(f"Seed para diversificação: {seed}")
-    
-    # APOSTA 1: EVITANDO DEZENAS PERIGOSAS (mais conservadora)
-    score1 = np.zeros(100, dtype=np.float32)
-    for d in range(100):
-        if d in dezenas_perigosas:
-            score1[d] = -10.0  # Penalidade EXTREMA
-        elif d in dezenas_em_sequencia:
-            score1[d] = -3.0   # Penalidade forte
-        else:
-            # Prefere dezenas frias com baixa probabilidade
-            score1[d] = atraso_n[d] * 0.6 + (1.0 - freq_curta_n[d]) * 0.4
-    
-    # APOSTA 2: HÍBRIDA OTIMIZADA (balanceada)
-    score2 = np.zeros(100, dtype=np.float32)
-    for d in range(100):
-        if d in dezenas_perigosas:
-            score2[d] = -3.0  # Penalidade
-        else:
-            # Combinação inteligente
-            score2[d] = (
-                penalidades_n[d] * 0.4 +      # Penalidades acumuladas
-                atraso_n[d] * 0.3 +           # Dezenas frias
-                (1.0 - probs_n[d]) * 0.2 +    # Baixa probabilidade
-                (1.0 - freq_media_n[d]) * 0.1 # Baixa freq média
-            )
-    
-    # APOSTA 3: DEZENAS FRIAS COM DIVERSIFICAÇÃO
-    score3 = np.zeros(100, dtype=np.float32)
-    
-    # Cria um pool de dezenas "seguras" (não perigosas, não em sequência)
-    dezenas_seguras = [
-        d for d in range(100) 
-        if d not in dezenas_perigosas and d not in dezenas_em_sequencia
+    logger.info(f"Seed refino (núcleo + flex): {seed}")
+
+    # quantidades podem ser afinadas depois
+    Q_FIXAS = 15
+    Q_VARIAVEIS = 15  # serão usadas como subgrupos em cada aposta
+    Q_TOTAL_CORE = Q_FIXAS + Q_VARIAVEIS  # 30 dezenas de "núcleo ampliado"
+
+    core_fixas = ranking[:Q_FIXAS]
+    core_var = ranking[Q_FIXAS:Q_TOTAL_CORE]
+
+    # pool flex (evita perigosas e sequências pesadas)
+    pool_flex = [
+        d for d in ranking[Q_TOTAL_CORE:]
+        if d not in dezenas_perigosas
     ]
-    
-    # Se tiver poucas dezenas seguras, relaxa os critérios
-    if len(dezenas_seguras) < 30:
-        logger.warning(f"Poucas dezenas seguras ({len(dezenas_seguras)}), relaxando critérios...")
-        dezenas_seguras = [d for d in range(100) if d not in dezenas_perigosas]
-    
-    logger.info(f"Dezenas seguras disponíveis: {len(dezenas_seguras)}")
-    
-    # Atribui scores altos apenas para dezenas seguras
-    for d in dezenas_seguras:
-        score3[d] = (
-            atraso_n[d] * 0.7 +
-            (1.0 - freq_curta_n[d]) * 0.2 +
-            (1.0 - freq_longa_n[d]) * 0.1
+    if len(pool_flex) < 60:
+        # fallback: permite algumas perigosas para não travar
+        extra = [d for d in ranking[Q_TOTAL_CORE:] if d not in pool_flex]
+        pool_flex.extend(extra)
+
+    logger.info(f"Núcleo fixo: {sorted(core_fixas)}")
+    logger.info(f"Núcleo variável (30-15): {sorted(core_var)}")
+    logger.info(f"Tamanho pool flex: {len(pool_flex)}")
+
+    apostas_refino: List[List[int]] = []
+    flex_usadas_global: Set[int] = set()
+
+    # ----------------------------------------------------
+    # 5) CONSTRUÇÃO DAS 3 APOSTAS
+    # ----------------------------------------------------
+    for idx in range(3):
+        # começa com o núcleo fixo
+        numeros = set(int(d) for d in core_fixas)
+
+        # escolhe parte do núcleo variável de forma diferente em cada aposta
+        core_var_lista = core_var.copy()
+        if idx == 0:
+            # primeira aposta: core_var como está
+            pass
+        elif idx == 1:
+            core_var_lista = list(reversed(core_var_lista))
+        else:
+            core_var_lista = list(rng.permutation(core_var_lista))
+
+        for d in core_var_lista:
+            if len(numeros) >= 30:  # 15 fixas + 15 variáveis
+                break
+            numeros.add(int(d))
+
+        # agora precisamos completar até 50 com dezenas flex
+        # score flex parte do base_score, mas:
+        score_flex = base_score.copy()
+
+        # penaliza forte as perigosas e em sequência
+        for d in dezenas_perigosas:
+            score_flex[d] -= 1.0
+        for d in dezenas_em_sequencia:
+            score_flex[d] -= 0.7
+
+        # penaliza moderadamente os flex já usados em outras apostas
+        for d in flex_usadas_global:
+            score_flex[d] -= 0.4
+
+        # gera barulho controlado para girar entre refinos
+        ruido = rng.normal(0, 0.05, size=100)
+        score_flex = score_flex + ruido
+
+        candidatos = [d for d in pool_flex if d not in numeros]
+        candidatos_ordenados = sorted(
+            candidatos,
+            key=lambda d: score_flex[d],
+            reverse=True,
         )
-    
-    # Para dezenas não seguras, score muito baixo
-    for d in range(100):
-        if d not in dezenas_seguras:
-            score3[d] = -20.0  # Rejeita forte
-    
-    # ====================================================
-    #   RUÍDO CONTROLADO PARA DIVERSIFICAÇÃO
-    # ====================================================
-    
-    ruido1 = rng.normal(0, 0.15, size=100)
-    ruido2 = rng.normal(0, 0.12, size=100)
-    ruido3 = rng.normal(0, 0.10, size=100)
-    
-    score1 += ruido1 * 0.2
-    score2 += ruido2 * 0.15
-    score3 += ruido3 * 0.1
-    
-    # ====================================================
-    #   GERA APOSTAS COM CONTROLE DE DISPONIBILIDADE
-    # ====================================================
-    
-    logger.info("Gerando Aposta 1...")
-    aposta1 = selecionar_dezenas_refino_corrigido(
-        score1,
-        dezenas_perigosas.union(dezenas_em_sequencia)
-    )
-    logger.info(f"Aposta 1 gerada: {len(aposta1)} dezenas")
-    
-    # Cria uma cópia global das dezenas usadas (para Aposta 2)
-    dezenas_usadas_global = set(aposta1)
-    
-    # Para aposta 2, evita TODAS as dezenas da aposta 1
-    logger.info("Gerando Aposta 2 (evitando Aposta 1)...")
-    
-    score2_modificado = score2.copy()
-    for d in dezenas_usadas_global:
-        score2_modificado[d] = -1000.0  # Penalidade EXTREMA
-    
-    aposta2 = selecionar_dezenas_refino_corrigido(
-        score2_modificado,
-        dezenas_usadas_global
-    )
-    logger.info(f"Aposta 2 gerada: {len(aposta2)} dezenas")
-    
-    # Atualiza dezenas usadas (apenas para estatística, não para veto da 3)
-    dezenas_usadas_global.update(aposta2)
-    
-    # APOSTA 3 – NÃO PODE EVITAR TODAS AS 100 DEZENAS
-    logger.info("Gerando Aposta 3 (diversificação controlada)...")
-    
-    # Para a Aposta 3, evitamos apenas dezenas realmente ruins:
-    restricoes_aposta3 = set(dezenas_perigosas) | set(dezenas_em_sequencia)
-    
-    score3_modificado = score3.copy()
-    for d in restricoes_aposta3:
-        score3_modificado[d] = -1000.0  # Penalização extrema apenas nas perigosas/seq
-    
-    aposta3 = selecionar_dezenas_refino_corrigido(
-        score3_modificado,
-        restricoes_aposta3  # NÃO usar dezenas_usadas_global aqui
-    )
-    logger.info(f"Aposta 3 gerada: {len(aposta3)} dezenas")
-    
-    # VERIFICAÇÃO CRÍTICA: garante 50 dezenas em cada aposta
-    apostas_refino = [aposta1, aposta2, aposta3]
-    
-    for i, aposta in enumerate(apostas_refino, 1):
-        if len(aposta) != 50:
-            logger.critical(f"Aposta {i} tem apenas {len(aposta)} dezenas!")
-            # Correção emergencial simples: completa com dezenas quaisquer
-            existentes = set(aposta)
-            for d in range(100):
-                if len(aposta) >= 50:
+
+        for d in candidatos_ordenados:
+            if len(numeros) >= 50:
+                break
+            numeros.add(int(d))
+
+        # se por algum motivo ainda não chegou em 50, completa com o ranking global
+        if len(numeros) < 50:
+            for d in ranking:
+                if len(numeros) >= 50:
                     break
-                if d not in existentes:
-                    aposta.append(d)
-                    existentes.add(d)
-            apostas_refino[i - 1] = sorted(aposta)
-    
-    # ====================================================
-    #   VERIFICAÇÃO E CORREÇÃO DE REPETIÇÕES
-    # ====================================================
-    
-    apostas_refino = corrigir_repeticoes_entre_apostas(apostas_refino)
-    
-    # Estatística de sobreposição entre apostas (apenas informativa)
-    sets_apostas = [set(ap) for ap in apostas_refino]
-    over_12 = len(sets_apostas[0].intersection(sets_apostas[1]))
-    over_13 = len(sets_apostas[0].intersection(sets_apostas[2]))
-    over_23 = len(sets_apostas[1].intersection(sets_apostas[2]))
-    logger.info(
-        f"Sobreposição entre apostas (qtd de dezenas iguais): "
-        f"1x2={over_12}, 1x3={over_13}, 2x3={over_23}"
-    )
-    
-    # ====================================================
-    #   OTIMIZAÇÃO PARA ESPELHOS
-    # ====================================================
-    
+                if d not in numeros:
+                    numeros.add(int(d))
+
+        aposta = sorted(numeros)
+        apostas_refino.append(aposta)
+
+        # registra flex usados (tudo que não é núcleo fixo)
+        flex_usadas_global.update(set(aposta) - set(core_fixas))
+
+        logger.info(f"Aposta {idx+1} gerada com {len(aposta)} dezenas.")
+
+    # ----------------------------------------------------
+    # 6) ESPELHOS (APENAS COMO COMPLEMENTO)
+    # ----------------------------------------------------
     universo = set(range(100))
-    espelhos_refino = []
-    
+    espelhos_refino: List[List[int]] = []
     for aposta in apostas_refino:
         espelho = sorted(list(universo - set(aposta)))
         espelhos_refino.append(espelho)
-    
-    # ====================================================
-    #   ANÁLISE DE QUALIDADE FINAL
-    # ====================================================
-    
-    logger.info("=== ANÁLISE FINAL DO /REFINO ===")
+
+    # ----------------------------------------------------
+    # 7) LOG DE QUALIDADE E DIVERSIDADE
+    # ----------------------------------------------------
+    logger.info("=== ANÁLISE FINAL DO /REFINO (NOVA LÓGICA) ===")
     for i, aposta in enumerate(apostas_refino, 1):
         perigosas_na_aposta = len(set(aposta) & dezenas_perigosas)
         sequencia_na_aposta = len(set(aposta) & dezenas_em_sequencia)
@@ -1726,18 +1649,26 @@ def gerar_apostas_refino(
             f"Aposta {i}: {len(aposta)} dezenas, "
             f"{perigosas_na_aposta} perigosas, {sequencia_na_aposta} em sequência"
         )
-    
-    # Estatística geral de diversidade
+
+    # diversidade entre apostas (permitida, mas monitorada)
+    sets_ap = [set(ap) for ap in apostas_refino]
+    over_12 = len(sets_ap[0].intersection(sets_ap[1]))
+    over_13 = len(sets_ap[0].intersection(sets_ap[2]))
+    over_23 = len(sets_ap[1].intersection(sets_ap[2]))
+    logger.info(
+        f"Sobreposição entre apostas (qtd dezenas iguais): "
+        f"1x2={over_12}, 1x3={over_13}, 2x3={over_23}"
+    )
+
     todas = []
     for ap in apostas_refino:
         todas.extend(ap)
     unique_total = len(set(todas))
-    logger.info(f"Total de dezenas distintas no bloco de refino: {unique_total} (máx=100)")
-    
-    logger.info(f"Refino gerado com sucesso (seed: {seed})")
-    
-    return apostas_refino, espelhos_refino
+    logger.info(f"Total de dezenas distintas no bloco: {unique_total} (máx=100)")
 
+    logger.info(f"Refino (nova lógica) gerado com sucesso (seed: {seed})")
+
+    return apostas_refino, espelhos_refino
 
 
 # ----------------------------------------------------
