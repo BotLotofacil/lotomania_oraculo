@@ -1553,51 +1553,63 @@ def gerar_apostas_refino(
         dezenas_perigosas: Set[int]
     ) -> List[List[int]]:
         """
-        Corrige apostas que têm dezenas repetidas.
+        Corrige apostas que têm dezenas repetidas - VERSÃO OTIMIZADA.
         """
-        logger.info("Aplicando correção de repetições...")
+        logger.info("Aplicando correção de repetições OTIMIZADA...")
         
-        # Identifica todas as dezenas usadas
-        dezenas_usadas = set()
+        # Cria uma cópia das apostas
         apostas_corrigidas = []
+        todas_dezenas_usadas = set()
         
-        for aposta in apostas:
+        for idx, aposta in enumerate(apostas, 1):
             aposta_corrigida = []
-            for dezena in aposta:
-                if dezena not in dezenas_usadas:
-                    aposta_corrigida.append(dezena)
-                    dezenas_usadas.add(dezena)
-                else:
-                    # Encontra substituta
-                    substituta = None
-                    for d in range(100):
-                        if (d not in dezenas_usadas and 
-                            d not in dezenas_perigosas and
-                            atrasos[d] > 10):  # Prefere dezenas muito frias
-                            substituta = d
-                            break
-                    
-                    if substituta is None:
-                        # Se não encontrou, pega qualquer disponível
-                        for d in range(100):
-                            if d not in dezenas_usadas:
-                                substituta = d
-                                break
-                    
-                    if substituta is not None:
-                        aposta_corrigida.append(substituta)
-                        dezenas_usadas.add(substituta)
-                        logger.debug(f"Substituiu {dezena} por {substituta}")
+            dezenas_aposta_set = set()
             
-            # Completa se necessário
-            while len(aposta_corrigida) < 50:
+            # Primeira passagem: mantém as dezenas únicas
+            for dezena in aposta:
+                if dezena not in todas_dezenas_usadas:
+                    aposta_corrigida.append(dezena)
+                    dezenas_aposta_set.add(dezena)
+                    todas_dezenas_usadas.add(dezena)
+            
+            # Segunda passagem: completa com dezenas disponíveis
+            dezenas_disponiveis = [
+                d for d in range(100) 
+                if d not in todas_dezenas_usadas
+            ]
+            
+            # Ordena as dezenas disponíveis por prioridade
+            def prioridade(d):
+                score = 0
+                if d not in dezenas_perigosas:
+                    score += 100
+                if atrasos[d] > 10:
+                    score += 50
+                score += atrasos[d]  # Prefere dezenas frias
+                return score
+            
+            dezenas_disponiveis.sort(key=prioridade, reverse=True)
+            
+            # Adiciona até completar 50
+            for dezena in dezenas_disponiveis:
+                if len(aposta_corrigida) >= 50:
+                    break
+                if dezena not in dezenas_aposta_set:
+                    aposta_corrigida.append(dezena)
+                    dezenas_aposta_set.add(dezena)
+                    todas_dezenas_usadas.add(dezena)
+            
+            # Terceira passagem: se ainda não completou, pega qualquer disponível
+            if len(aposta_corrigida) < 50:
                 for d in range(100):
-                    if d not in dezenas_usadas:
-                        aposta_corrigida.append(d)
-                        dezenas_usadas.add(d)
+                    if len(aposta_corrigida) >= 50:
                         break
+                    if d not in dezenas_aposta_set:
+                        aposta_corrigida.append(d)
+                        todas_dezenas_usadas.add(d)
             
             apostas_corrigidas.append(sorted(aposta_corrigida))
+            logger.info(f"Aposta {idx} corrigida: {len(aposta_corrigida)} dezenas")
         
         return apostas_corrigidas
     
