@@ -2331,7 +2331,7 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     COMANDO /refino - VERSÃO ULTRA-EFICIENTE
-    
+
     Gera 3 apostas usando TUDO que aprendemos:
     - Penalidades exponenciais
     - Análise de sequências
@@ -2342,15 +2342,50 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         history = load_history(HISTORY_PATH)
         model = load_model_local()
-        
-        # Usa a versão ULTRA-EFICIENTE CORRIGIDA
+
+        # Usa a versão ULTRA-EFICIENTE (gerador principal)
         apostas_refino, espelhos_refino = gerar_apostas_refino(history, model)
-        
+
         # CONVERTE para int nativo
         apostas_py = [[int(x) for x in ap] for ap in apostas_refino]
         espelhos_py = [[int(x) for x in esp] for esp in espelhos_refino]
-        
-        # Salva como "modo = refino" para o /confirmar
+
+        # ====================================================
+        # BLINDAGEM: garante que a APOSTA 3 venha com dezenas
+        # ====================================================
+        # Garante pelo menos 3 apostas/espelhos nas estruturas
+        while len(apostas_py) < 3:
+            apostas_py.append([])
+        while len(espelhos_py) < 3:
+            espelhos_py.append([])
+
+        # Se a Aposta 3 veio vazia ou com menos de 50 dezenas,
+        # reconstruímos uma Aposta 3 segura a partir das dezenas
+        # que ainda não foram usadas nas Apostas 1 e 2.
+        if len(apostas_py[2]) < 50:
+            universo = list(range(100))
+
+            usadas = set(apostas_py[0]) | set(apostas_py[1])
+            # Dezenas ainda não usadas nas duas primeiras apostas
+            restantes = [d for d in universo if d not in usadas]
+
+            # Se ainda assim faltar dezena para chegar em 50,
+            # completa reaproveitando algumas (sem travar).
+            if len(restantes) < 50:
+                for d in universo:
+                    if len(restantes) >= 50:
+                        break
+                    if d not in restantes:
+                        restantes.append(d)
+
+            aposta3 = sorted(restantes[:50])
+            apostas_py[2] = aposta3
+
+            # Recalcula o espelho da Aposta 3 para manter coerência
+            universo_set = set(universo)
+            espelhos_py[2] = sorted(universo_set - set(aposta3))
+
+        # Salva como "modo = refino" para o /confirmar e /avaliar
         try:
             user = update.effective_user
             dados = {
@@ -2364,20 +2399,20 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 json.dump(dados, f, ensure_ascii=False, indent=2)
         except Exception as e_save:
             logger.exception(f"Erro ao salvar última geração (refino): {e_save}")
-        
+
         # Formata resposta
         linhas = []
         linhas.append("🎯 COMANDO /REFINO - VERSÃO ULTRA-EFICIENTE")
         linhas.append("=" * 50)
         linhas.append("")
-        
+
         linhas.append("📊 ESTRATÉGIAS APLICADAS:")
         linhas.append("1. Penalidades exponenciais para sequências")
         linhas.append("2. Blacklist automática para dezenas persistentes")
         linhas.append("3. Otimização para maximizar acertos nos ESPELHOS")
         linhas.append("4. Diversificação garantida entre as apostas")
         linhas.append("")
-        
+
         # Aposta 1
         linhas.append("🔴 APOSTA 1 - EVITAÇÃO RADICAL:")
         linhas.append("• Foca em dezenas NÃO perigosas")
@@ -2386,7 +2421,7 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         linhas.append("")
         linhas.append(format_dezenas_sortidas(apostas_py[0]))
         linhas.append("")
-        
+
         # Aposta 2
         linhas.append("🟡 APOSTA 2 - HÍBRIDA OTIMIZADA:")
         linhas.append("• Combina múltiplos fatores")
@@ -2395,7 +2430,7 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         linhas.append("")
         linhas.append(format_dezenas_sortidas(apostas_py[1]))
         linhas.append("")
-        
+
         # Aposta 3
         linhas.append("🟢 APOSTA 3 - DEZENAS SEGURAS:")
         linhas.append("• Pool restrito de dezenas seguras")
@@ -2404,14 +2439,14 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         linhas.append("")
         linhas.append(format_dezenas_sortidas(apostas_py[2]))
         linhas.append("")
-        
+
         linhas.append("📈 ESPELHOS OTIMIZADOS PARA MÁXIMOS ACERTOS")
         linhas.append("")
         linhas.append("💡 DICA: Use /avaliar para testar sem treinar")
         linhas.append("       Use /confirmar para aplicar aprendizado")
-        
+
         await update.message.reply_text("\n".join(linhas))
-        
+
     except Exception as e:
         logger.exception("Erro ao gerar apostas de refino")
         await update.message.reply_text(f"❌ Erro no /refino: {e}")
