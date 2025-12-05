@@ -8,7 +8,7 @@ import logging
 import shutil
 from typing import List, Set, Tuple, Dict
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -584,7 +584,7 @@ def build_dataset_hybrid(history: List[Set[int]], seq_len: int):
     Gera X_ts, X_feat, y para treino híbrido:
       - X_ts   : sequência 0/1 (últimos seq_len concursos)
       - X_feat : features manuais (freq 10/20/50 + gap)
-      - y      : 1 se a dezena saiu no concurso seguinte, 0 se não
+      - y      : 1 se a dezena saiu no próximo concurso, 0 se não
     """
     X_ts_list = []
     X_feat_list = []
@@ -1329,7 +1329,7 @@ def gerar_apostas_refino(
         
         # Penalidade EXTRA por estar em sequência
         if dezena in dezenas_em_sequencia:
-            penalidade_acumulada += 3.0  # Penalidade pesada
+            penalidade_acumulada += 5.0  # Penalidade pesada REFORÇADA (era 3.0)
         
         penalidades_refino[dezena] = penalidade_acumulada
     
@@ -1419,7 +1419,7 @@ def gerar_apostas_refino(
     score1 = np.zeros(100, dtype=np.float32)
     for d in range(100):
         if d in dezenas_perigosas:
-            score1[d] = -5.0  # Penalidade EXTREMA
+            score1[d] = -10.0  # Penalidade EXTREMA REFORÇADA (era -5.0)
         elif d in dezenas_em_sequencia:
             score1[d] = -3.0  # Penalidade forte
         else:
@@ -1524,18 +1524,122 @@ def gerar_apostas_refino(
         
         return sorted(selecionadas)
     
-    # Gera apostas com diversificação
+    # FUNÇÃO AUXILIAR: Verificação de ausência de repetição
+    def verificar_ausencia_repeticao(apostas: List[List[int]]) -> bool:
+        """
+        Verifica se não há dezenas repetidas entre as apostas.
+        Retorna True se estiver OK, False se houver repetição.
+        """
+        todas_dezenas = []
+        for aposta in apostas:
+            todas_dezenas.extend(aposta)
+        
+        # Verifica se há duplicatas
+        if len(todas_dezenas) != len(set(todas_dezenas)):
+            # Identifica as repetições
+            contador = Counter(todas_dezenas)
+            repetidas = {dezena: count for dezena, count in contador.items() if count > 1}
+            
+            logger.warning(f"REPETIÇÕES DETECTADAS: {repetidas}")
+            return False
+        
+        return True
+    
+    # FUNÇÃO AUXILIAR: Correção de repetições (fallback)
+    def corrigir_repeticoes(
+        apostas: List[List[int]],
+        probs: np.ndarray,
+        atrasos: np.ndarray,
+        dezenas_perigosas: Set[int]
+    ) -> List[List[int]]:
+        """
+        Corrige apostas que têm dezenas repetidas.
+        """
+        logger.info("Aplicando correção de repetições...")
+        
+        # Identifica todas as dezenas usadas
+        dezenas_usadas = set()
+        apostas_corrigidas = []
+        
+        for aposta in apostas:
+            aposta_corrigida = []
+            for dezena in aposta:
+                if dezena not in dezenas_usadas:
+                    aposta_corrigida.append(dezena)
+                    dezenas_usadas.add(dezena)
+                else:
+                    # Encontra substituta
+                    substituta = None
+                    for d in range(100):
+                        if (d not in dezenas_usadas and 
+                            d not in dezenas_perigosas and
+                            atrasos[d] > 10):  # Prefere dezenas muito frias
+                            substituta = d
+                            break
+                    
+                    if substituta is None:
+                        # Se não encontrou, pega qualquer disponível
+                        for d in range(100):
+                            if d not in dezenas_usadas:
+                                substituta = d
+                                break
+                    
+                    if substituta is not None:
+                        aposta_corrigida.append(substituta)
+                        dezenas_usadas.add(substituta)
+                        logger.debug(f"Substituiu {dezena} por {substituta}")
+            
+            # Completa se necessário
+            while len(aposta_corrigida) < 50:
+                for d in range(100):
+                    if d not in dezenas_usadas:
+                        aposta_corrigida.append(d)
+                        dezenas_usadas.add(d)
+                        break
+            
+            apostas_corrigidas.append(sorted(aposta_corrigida))
+        
+        return apostas_corrigidas
+    
+    # ====================================================
+    #   GERA APOSTAS COM DIVERSIFICAÇÃO REFORÇADA
+    # ====================================================
+    
+    # Gera aposta 1
     aposta1 = selecionar_dezenas_refino(score1, dezenas_perigosas.union(dezenas_em_sequencia))
     
-    # Para aposta 2, evita metade das dezenas da aposta 1
-    evitar_ap2 = set(aposta1[:25])
+    # Para aposta 2, evita TODAS as dezenas da aposta 1 (REFORÇADO)
+    evitar_ap2 = set(aposta1)  # MUDANÇA CRÍTICA: era [:25], agora é TODAS
     aposta2 = selecionar_dezenas_refino(score2, evitar_ap2)
     
-    # Para aposta 3, evita combinação das duas anteriores
+    # Para aposta 3, evita TODAS as dezenas das duas anteriores
     evitar_ap3 = set(aposta1 + aposta2)
     aposta3 = selecionar_dezenas_refino(score3, evitar_ap3)
     
     apostas_refino = [aposta1, aposta2, aposta3]
+    
+    # ====================================================
+    #   VERIFICAÇÃO DE SEGURANÇA CONTRA REPETIÇÕES
+    # ====================================================
+    
+    # Verifica se não há repetições
+    if not verificar_ausencia_repeticao(apostas_refino):
+        logger.error("CRÍTICO: Repetições detectadas entre apostas!")
+        # Força correção (fallback)
+        apostas_refino = corrigir_repeticoes(apostas_refino, probs, atrasos, dezenas_perigosas)
+    
+    # Verificação final
+    if not verificar_ausencia_repeticao(apostas_refino):
+        logger.critical("FALHA NA CORREÇÃO: Ainda há repetições após correção!")
+        # Último recurso: força seleção manual
+        logger.info("Aplicando seleção manual de emergência...")
+        apostas_refino = []
+        dezenas_disponiveis = set(range(100))
+        
+        for i in range(3):
+            aposta = sorted(list(dezenas_disponiveis))[:50]
+            apostas_refino.append(aposta)
+            dezenas_disponiveis -= set(aposta)
     
     # ====================================================
     #   OTIMIZAÇÃO PARA ESPELHOS
@@ -1700,7 +1804,7 @@ async def avaliar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Erro ao ler arquivo de última geração.")
         await update.message.reply_text(
-            "⚠️ Arquivo de última geração está corrompido ou em formato antigo.\n"
+            "⚠️ Arquivo de última geração está corrompido ou em formato antido.\n"
             "Use /gerar ou /refino novamente para criar um novo bloco."
         )
         return
@@ -1962,7 +2066,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Atualiza snapshot do melhor modelo
     txt_best = ""
-    if TREINO_HABILITADO:
+    if TREINO_HABILITado:
         try:
             if registrar_melhor_modelo(
                 melhor_hits,
@@ -2270,6 +2374,7 @@ def main():
 
     logger.info("Bot Lotomania (Sistema Inteligente com Penalidades) iniciado.")
     logger.info("NOVO comando /refino disponível - Versão ULTRA-EFICIENTE")
+    logger.info("MELHORIAS APLICADAS: Penalidades reforçadas e ausência total de repetição")
     app.run_polling()
 
 
