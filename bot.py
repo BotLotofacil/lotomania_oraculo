@@ -900,83 +900,111 @@ def treino_incremental_pos_concurso(
     history: List[Set[int]], resultado_set: set[int], modo: str = "oraculo"
 ):
     """
-    Treino incremental pós-concurso COM APRENDIZADO DE PENALIDADES.
+    Treino incremental pós-concurso COM APRENDIZADO DE PENALIDADES (VERSÃO CORRIGIDA).
+
+    Ideia correta:
+    - O modelo foi treinado com a lógica: estado do concurso i  ->  resultado do concurso i+1
+    - No incremental, fazemos a MESMA COISA, mas só para a transição mais recente.
+
+    Ou seja:
+    - Usamos o concurso ANTERIOR como base (idx_base = len(history) - 2)
+    - Usamos o resultado NOVO (resultado_set) como target.
+    - Mantemos os pesos atuais e continuamos o treinamento (não reseta).
     """
     try:
         wrapper = load_model_local()
     except FileNotFoundError:
-        logger.warning("Treino incremental ignorado: modelo ainda não treinado (/treinar).")
+        # Só dá esse erro se você NUNCA rodou /treinar pelo menos uma vez.
+        logger.warning(
+            "Treino incremental ignorado: modelo ainda não treinado (/treinar inicial necessário apenas uma vez)."
+        )
         return
     except Exception as e:
         logger.exception(f"Erro ao carregar modelo para treino incremental: {e}")
         return
 
+    # Precisamos de pelo menos 2 concursos no histórico:
+    # penúltimo = estado, último = resultado que você está confirmando.
     if len(history) < 2:
-        logger.warning("Histórico insuficiente para treino incremental.")
+        logger.warning("Histórico insuficiente para treino incremental (menos de 2 concursos).")
         return
 
     seq_len = wrapper.seq_len
     net = wrapper.net
 
     # ------------------------------------------------
-    # DEFINIÇÃO DA JANELA TEMPORAL PARA INTENSIVO
+    # DEFINIÇÃO DO PONTO DE TREINO
     # ------------------------------------------------
-    if INTENSIVE_LEARNING:
-        # usa até os últimos 30 concursos como base
-        janela_treino = 30
-        idx_final = len(history) - 1
-        idx_inicio = max(seq_len - 1, idx_final - janela_treino + 1)
-        indices_base = range(idx_inicio, idx_final + 1)
-    else:
-        # comportamento antigo: só o último concurso
-        indices_base = [len(history) - 1]
+    # Supondo que o CSV já contém o NOVO concurso:
+    #   idx_final = índice do último concurso do histórico
+    #   idx_base  = concurso imediatamente anterior (estado)
+    idx_final = len(history) - 1
+    idx_base = idx_final - 1
 
-    X_ts_list = []
-    X_feat_list = []
-    y_list = []
+    if idx_base < 0:
+        logger.warning("Não há concurso anterior suficiente para treino incremental.")
+        return
 
-    for idx in indices_base:
-        for dezena in range(100):
-            ts = compute_ts_for_dozen(history, idx, dezena, seq_len)
-            feats = compute_features_for_dozen(history, idx, dezena)
-            X_ts_list.append(ts)
-            X_feat_list.append(feats)
+    # Se o histórico ainda for muito curto pra janela seq_len, evita quebrar o modelo.
+    if len(history) < seq_len + 1:
+        logger.warning(
+            "Histórico ainda menor que seq_len+1 (len(history)=%d, seq_len=%d). "
+            "Treino incremental pulado para evitar inconsistência.",
+            len(history),
+            seq_len,
+        )
+        return
 
-            # o target sempre é o resultado_set do concurso recém-confirmado
-            y_list.append(1 if dezena in resultado_set else 0)
+    X_ts_list: list[list[float]] = []
+    X_feat_list: list[list[float]] = []
+    y_list: list[int] = []
+
+    # ------------------------------------------------
+    # CONSTRÓI AMOSTRAS PARA TODAS AS DEZENAS (00–99)
+    # NO PONTO idx_base, COM TARGET = resultado_set
+    # ------------------------------------------------
+    for dezena in range(100):
+        ts = compute_ts_for_dozen(history, idx_base, dezena, seq_len)
+        feats = compute_features_for_dozen(history, idx_base, dezena)
+        X_ts_list.append(ts)
+        X_feat_list.append(feats)
+        y_list.append(1 if dezena in resultado_set else 0)
 
     X_ts = np.array(X_ts_list, dtype=np.float32)
     X_feat = np.array(X_feat_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.float32)
 
-    # scaler já existente
+    # Usa o scaler JÁ APRENDIDO no treino forte (/treinar)
     X_feat_scaled = (X_feat - wrapper.mean_feat) / wrapper.std_feat
 
     # ------------------------------------------------
     # HIPERPARÂMETROS DE TREINO INCREMENTAL
     # ------------------------------------------------
     if INTENSIVE_LEARNING:
-        epocas = 80
+        # Incremental forte, mas ainda muito menor que /treinar
+        epocas = 40
         batch = 256
     else:
-        epocas = 10
+        epocas = 8
         batch = 100
 
     net.fit(X_ts, X_feat_scaled, y, epochs=epocas, batch_size=batch)
 
+    # ------------------------------------------------
     # APLICA PENALIDADES APÓS O TREINO
+    # ------------------------------------------------
     aplicar_penalidades_apos_resultado(resultado_set, modo)
 
-    # salva e atualiza cache
+    # Salva e atualiza cache
     save_model(wrapper)
     global _model_cache
     _model_cache = wrapper
 
     logger.info(
-        "Treino incremental pós-concurso concluído (modo %s, amostras=%d, épocas=%d) + penalidades aplicadas.",
+        "Treino incremental pós-concurso CONCLUÍDO (modo %s, épocas=%d, amostras=%d) + penalidades aplicadas.",
         "INTENSIVO" if INTENSIVE_LEARNING else "NORMAL",
-        len(y),
         epocas,
+        len(y),
     )
 
 
