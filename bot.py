@@ -13,7 +13,15 @@ from collections import defaultdict, Counter
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+
+# ================================
+# BLOQUEIO TOTAL GLOBAL (BLACKLIST)
+# ================================
+
+BLOCKED_USERS = {848572364}  # user_id bloqueado
+
 
 # ----------------------------------------------------
 # Caminhos de arquivos principais
@@ -2772,10 +2780,17 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro no /refino: {e}")
 
 
+from telegram.ext import MessageHandler, filters
+
+async def bloqueio_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and user.id in BLOCKED_USERS:
+        return  # silêncio absoluto
+
+
 # ----------------------------------------------------
 # MAIN
 # ----------------------------------------------------
-
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -2784,11 +2799,17 @@ def main():
 
     app = ApplicationBuilder().token(token).build()
 
+    # BLOQUEIO GLOBAL — roda antes de qualquer comando
+    app.add_handler(
+        MessageHandler(filters.ALL, bloqueio_total),
+        group=0
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("treinar", treinar_cmd))
     app.add_handler(CommandHandler("gerar", gerar_cmd))
     app.add_handler(CommandHandler("bolao", bolao_cmd))
-    app.add_handler(CommandHandler("refino", refino_cmd))  
+    app.add_handler(CommandHandler("refino", refino_cmd))
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
     app.add_handler(CommandHandler("avaliar", avaliar_cmd))
     app.add_handler(CommandHandler("status_penalidades", status_penalidades_cmd))
