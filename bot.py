@@ -13,7 +13,10 @@ from collections import defaultdict, Counter
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, filters, ApplicationHandlerStop
+)
 
 
 # ================================
@@ -2780,12 +2783,10 @@ async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro no /refino: {e}")
 
 
-from telegram.ext import MessageHandler, filters
-
 async def bloqueio_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user and user.id in BLOCKED_USERS:
-        return  # silêncio absoluto
+        raise ApplicationHandlerStop  # corta TUDO (silêncio absoluto)
 
 
 # ----------------------------------------------------
@@ -2802,7 +2803,7 @@ def main():
     # BLOQUEIO GLOBAL — roda antes de qualquer comando
     app.add_handler(
         MessageHandler(filters.ALL, bloqueio_total),
-        group=0
+        group=-1
     )
 
     app.add_handler(CommandHandler("start", start))
