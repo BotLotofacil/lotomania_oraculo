@@ -2301,6 +2301,7 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /bolao — NOVO COMANDO (sem mexer no /gerar)
 # Janela: últimos 50 concursos
 # Saída: 4 apostas (50 dezenas) + espelhos (compat /avaliar)
+# Correção: VARIAÇÃO CONTROLADA por execução (seed variável + amostragem ponderada)
 # ============================================================
 
 def _bolao_window(history, janela: int = 50):
@@ -2310,14 +2311,11 @@ def _bolao_window(history, janela: int = 50):
 
 
 def _count_freq_and_delay(hist_window):
-    # freq: contagem nos concursos da janela
     freq = np.zeros(100, dtype=np.int32)
     for conc in hist_window:
         for d in conc:
             freq[d] += 1
 
-    # delay (atraso): quantos concursos desde a última aparição (na janela toda)
-    # delay menor = mais recente
     delay = np.zeros(100, dtype=np.int32)
     for d in range(100):
         gap = 0
@@ -2327,13 +2325,12 @@ def _count_freq_and_delay(hist_window):
                 found = True
                 break
             gap += 1
-        delay[d] = gap if found else len(hist_window) + 5  # penaliza se não apareceu na janela
+        delay[d] = gap if found else len(hist_window) + 5
 
     return freq, delay
 
 
 def _cooc_pairs(hist_window):
-    # cooc[i,j]: quantas vezes i e j saíram juntos na janela
     cooc = np.zeros((100, 100), dtype=np.int16)
     for conc in hist_window:
         arr = sorted(conc)
@@ -2355,24 +2352,43 @@ def _norm01(x: np.ndarray) -> np.ndarray:
     return (x - mn) / (mx - mn)
 
 
-def _choose_top(scores: np.ndarray, k: int, forbid: set[int] | None = None, rng=None) -> list[int]:
+def _choose_top(scores: np.ndarray, k: int, forbid: set[int] | None = None) -> list[int]:
     forbid = forbid or set()
     idxs = [i for i in range(100) if i not in forbid]
-    # ordena por score desc; desempate por rng se fornecido
-    if rng is None:
-        idxs.sort(key=lambda i: float(scores[i]), reverse=True)
-    else:
-        # desempate leve com ruído muito pequeno só pra evitar empates travando
-        noise = rng.normal(0, 1e-6, size=100)
-        idxs.sort(key=lambda i: float(scores[i] + noise[i]), reverse=True)
+    idxs.sort(key=lambda i: float(scores[i]), reverse=True)
     return idxs[:k]
 
 
+def _weighted_sample_no_replace(scores: np.ndarray, k: int, rng, forbid: set[int] | None = None, temperature: float = 1.0):
+    """
+    Amostragem ponderada SEM reposição.
+    - scores: quanto maior, mais chance
+    - temperature: <1.0 deixa mais "top"; >1.0 deixa mais "solto"
+    """
+    forbid = forbid or set()
+    idxs = np.array([i for i in range(100) if i not in forbid], dtype=np.int32)
+    if idxs.size == 0:
+        return []
+
+    s = scores[idxs].astype(np.float64)
+
+    # estabiliza e garante positividade
+    s = s - s.min()
+    s = np.clip(s, 0.0, None) + 1e-9
+
+    # temperatura (controla o quanto varia)
+    if temperature <= 0:
+        temperature = 1.0
+    s = np.power(s, 1.0 / temperature)
+
+    p = s / s.sum()
+
+    k = int(min(k, idxs.size))
+    chosen = rng.choice(idxs, size=k, replace=False, p=p)
+    return [int(x) for x in chosen]
+
+
 def _stratified_pick(candidates: list[int], k: int, rng, bands=None) -> list[int]:
-    """
-    Seleção estratificada por faixa para evitar travar em um range só.
-    bands: lista de tuplas (ini, fim) inclusivo.
-    """
     if bands is None:
         bands = [(0, 19), (20, 39), (40, 59), (60, 79), (80, 99)]
 
@@ -2381,7 +2397,6 @@ def _stratified_pick(candidates: list[int], k: int, rng, bands=None) -> list[int
     for a, b in bands:
         buckets.append([d for d in range(a, b + 1) if d in cand_set])
 
-    # tenta distribuir: 10 por faixa (5 faixas) quando k=50
     target = [k // len(buckets)] * len(buckets)
     rem = k - sum(target)
     i = 0
@@ -2397,77 +2412,84 @@ def _stratified_pick(candidates: list[int], k: int, rng, bands=None) -> list[int
         rng.shuffle(bucket)
         chosen.extend(bucket[:t])
 
-    # completa se faltou
     if len(chosen) < k:
         rest = [d for d in candidates if d not in set(chosen)]
         rng.shuffle(rest)
         chosen.extend(rest[: (k - len(chosen))])
 
-    # corta se passou
     return sorted(chosen[:k])
 
 
-def gerar_apostas_bolao(history: list[set[int]]) -> tuple[list[list[int]], list[list[int]]]:
+def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[list[list[int]], list[list[int]]]:
     """
     Gera 4 apostas (50 dezenas) com funções:
       A1: Quentes + Puxadas (tendência)
-      A2: Alternância com viés para faixas altas (80–99) e pontes (60–79)
+      A2: Alternância com viés alto (60–99)
       A3: Atrasadas/retorno (quebra de ciclo)
       A4: Balanceada robusta (estratificada)
     Retorna (apostas, espelhos)
+
+    ✅ Agora varia a cada execução:
+    - seed variável (passado via rng)
+    - seleção ponderada na periferia (mantém lógica, mas gira dezenas)
+    - micro-núcleo estável e controlado
     """
     hist_window = _bolao_window(history, 50)
     freq, delay = _count_freq_and_delay(hist_window)
     cooc = _cooc_pairs(hist_window)
 
     freq_n = _norm01(freq)
-    # delay menor = melhor recência; vamos inverter para recency_n alto = recente
     delay_n = _norm01(delay)
     recency_n = 1.0 - delay_n
-
-    # seed determinística: usa o tamanho do histórico e a soma do último concurso
-    last = sorted(list(history[-1]))
-    seed = (len(history) * 1000 + sum(last) * 7) % 1_000_000
-    rng = np.random.default_rng(seed)
+    delay_hi = _norm01(delay)  # maior = mais atrasada
 
     # -----------------------------
-    # Micro-núcleo (4 dezenas)
-    # score_nucleo privilegia presença + recência, com leve penalidade para “super quentes”
+    # Micro-núcleo (4 dezenas) — ESTÁVEL (sem rng)
     # -----------------------------
     score_nucleo = (0.55 * freq_n) + (0.45 * recency_n) - (0.08 * (freq_n ** 2))
-    nucleo = _choose_top(score_nucleo, 4, rng=rng)
+    nucleo = _choose_top(score_nucleo, 4)
     nucleo_set = set(nucleo)
 
-    # -----------------------------
-    # A1 — Quentes + Puxadas
-    # - começa com quentes (freq alta) e adiciona puxadas (cooc alta com núcleo+quentes)
-    # -----------------------------
-    hot = _choose_top(freq_n, 18, rng=rng)  # top 18 quentes
-    hot_set = set(hot) | nucleo_set
+    # Pequena rotação controlada do núcleo: 1 dezena pode girar a cada 3 execuções
+    # (mantém identidade, mas evita "congelar" pra sempre)
+    if bolao_run % 3 == 0:
+        cand_nucleo = _choose_top(score_nucleo, 10, forbid=set(nucleo))
+        if cand_nucleo:
+            troca_out = nucleo[-1]
+            troca_in = cand_nucleo[0]
+            nucleo = sorted(list((set(nucleo) - {troca_out}) | {troca_in}))
+            nucleo_set = set(nucleo)
 
-    # puxadas: soma de cooc com hot_set
-    pull_score = np.zeros(100, dtype=np.float32)
-    for d in range(100):
-        pull_score[d] = float(np.sum(cooc[d, list(hot_set)])) if d not in hot_set else 0.0
+    # -----------------------------
+    # Helpers de puxada
+    # -----------------------------
+    def pull_from(set_base: set[int]) -> np.ndarray:
+        ps = np.zeros(100, dtype=np.float32)
+        base_list = list(set_base)
+        for d in range(100):
+            if d in set_base:
+                ps[d] = 0.0
+            else:
+                ps[d] = float(np.sum(cooc[d, base_list])) if base_list else 0.0
+        return _norm01(ps)
 
-    pull_n = _norm01(pull_score)
+    # -----------------------------
+    # A1 — Quentes + Puxadas (variação leve)
+    # -----------------------------
+    hot = set(_choose_top(freq_n, 18)) | nucleo_set
+    pull_n = pull_from(hot)
+
     score_a1 = (0.60 * freq_n) + (0.30 * pull_n) + (0.10 * recency_n)
-    base_a1 = sorted(set(_choose_top(score_a1, 50, rng=rng)) | nucleo_set)
-    # garante 50
-    if len(base_a1) > 50:
-        # corta os piores mantendo núcleo
-        keep = set(nucleo)
-        rest = [d for d in base_a1 if d not in keep]
-        rest.sort(key=lambda d: float(score_a1[d]), reverse=True)
-        base_a1 = sorted(list(keep) + rest[: (50 - len(keep))])
-    elif len(base_a1) < 50:
-        fill = [d for d in range(100) if d not in set(base_a1)]
-        fill.sort(key=lambda d: float(score_a1[d]), reverse=True)
-        base_a1 = sorted(base_a1 + fill[: (50 - len(base_a1))])
+
+    # fixa uma base “core” e gira o resto
+    core_a1 = set(_choose_top(score_a1, 28)) | nucleo_set  # 28 mais fortes
+    forbid_a1 = set(core_a1)
+    # gira 22 restantes por amostragem ponderada
+    extra_a1 = _weighted_sample_no_replace(score_a1, 50 - len(core_a1), rng, forbid=forbid_a1, temperature=0.85)
+    base_a1 = sorted(list(core_a1 | set(extra_a1)))
 
     # -----------------------------
-    # A2 — Alternância com viés alto
-    # - favorece 60–99 + números com boa cooc e freq média/alta
+    # A2 — Alternância (viés alto) com rotação real
     # -----------------------------
     band_bias = np.zeros(100, dtype=np.float32)
     for d in range(100):
@@ -2480,64 +2502,59 @@ def gerar_apostas_bolao(history: list[set[int]]) -> tuple[list[list[int]], list[
         else:
             band_bias[d] = 0.10
 
-    pull2_score = np.zeros(100, dtype=np.float32)
-    for d in range(100):
-        pull2_score[d] = float(np.sum(cooc[d, nucleo])) if d not in nucleo_set else 0.0
-    pull2_n = _norm01(pull2_score)
-
+    pull2_n = pull_from(nucleo_set)
     score_a2 = (0.45 * freq_n) + (0.25 * pull2_n) + (0.10 * recency_n) + (0.20 * band_bias)
-    cand_a2 = _choose_top(score_a2, 75, rng=rng)  # candidatos fortes
-    # pega 50 estratificando, mas com faixa alta mais carregada
-    # usamos bandas com mais peso nas altas: duplicamos faixas altas via candidatos
-    base_a2 = _stratified_pick(cand_a2, 50, rng=rng, bands=[(0, 19), (20, 39), (40, 59), (60, 79), (80, 99)])
-    # garante núcleo dentro
-    base_a2 = sorted(set(base_a2) | nucleo_set)
-    if len(base_a2) > 50:
-        rest = [d for d in base_a2 if d not in nucleo_set]
-        rest.sort(key=lambda d: float(score_a2[d]), reverse=True)
-        base_a2 = sorted(list(nucleo_set) + rest[: (50 - len(nucleo_set))])
-    elif len(base_a2) < 50:
-        fill = [d for d in range(100) if d not in set(base_a2)]
-        fill.sort(key=lambda d: float(score_a2[d]), reverse=True)
-        base_a2 = sorted(base_a2 + fill[: (50 - len(base_a2))])
+
+    core_a2 = set(_choose_top(score_a2, 24)) | nucleo_set
+    forbid_a2 = set(core_a2)
+    extra_a2 = _weighted_sample_no_replace(score_a2, 50 - len(core_a2), rng, forbid=forbid_a2, temperature=0.95)
+    base_a2 = sorted(list(core_a2 | set(extra_a2)))
 
     # -----------------------------
-    # A3 — Atrasadas/retorno (quebra)
-    # - privilegia delay alto (mais atrasadas), mas evita as totalmente “mortas” (freq muito baixa)
+    # A3 — Atrasadas/retorno (quebra) com rotação real
     # -----------------------------
-    delay_hi = _norm01(delay)  # maior = mais atrasada
-    # penaliza as “mortas”: freq muito baixa
     score_a3 = (0.65 * delay_hi) + (0.20 * (1.0 - freq_n)) + (0.15 * pull2_n)
-    # tira “super quentes” do topo da lista para quebrar ciclo
-    forbid_hot = set(_choose_top(freq_n, 10, rng=rng))
-    cand_a3 = _choose_top(score_a3, 80, forbid=forbid_hot, rng=rng)
-    base_a3 = _stratified_pick(cand_a3, 50, rng=rng)
-    base_a3 = sorted(set(base_a3) | nucleo_set)
-    if len(base_a3) > 50:
-        rest = [d for d in base_a3 if d not in nucleo_set]
-        rest.sort(key=lambda d: float(score_a3[d]), reverse=True)
-        base_a3 = sorted(list(nucleo_set) + rest[: (50 - len(nucleo_set))])
-    elif len(base_a3) < 50:
-        fill = [d for d in range(100) if d not in set(base_a3)]
-        fill.sort(key=lambda d: float(score_a3[d]), reverse=True)
-        base_a3 = sorted(base_a3 + fill[: (50 - len(base_a3))])
+    forbid_hot = set(_choose_top(freq_n, 10))
+    # core da quebra (mais atrasadas que não sejam super quentes)
+    core_candidates_a3 = [d for d in _choose_top(score_a3, 40) if d not in forbid_hot]
+    core_a3 = set(core_candidates_a3[:22]) | nucleo_set
+    forbid_a3 = set(core_a3) | forbid_hot
+    extra_a3 = _weighted_sample_no_replace(score_a3, 50 - len(core_a3), rng, forbid=forbid_a3, temperature=1.05)
+    base_a3 = sorted(list(core_a3 | set(extra_a3)))
 
     # -----------------------------
-    # A4 — Balanceada robusta (estratificada e sem travar faixa)
-    # - mistura freq+recency+puxadas, com seleção estratificada
+    # A4 — Balanceada robusta (estratificada) + rotação
     # -----------------------------
     score_a4 = (0.45 * freq_n) + (0.25 * recency_n) + (0.30 * pull2_n)
-    cand_a4 = _choose_top(score_a4, 80, rng=rng)
-    base_a4 = _stratified_pick(cand_a4, 50, rng=rng)
+    # pega um pool grande via amostragem ponderada e depois estratifica
+    pool_a4 = set(_choose_top(score_a4, 30)) | set(_weighted_sample_no_replace(score_a4, 60, rng, forbid=set(), temperature=0.95))
+    pool_a4 = sorted(list(pool_a4 | nucleo_set))
+    base_a4 = _stratified_pick(pool_a4, 50, rng=rng)
     base_a4 = sorted(set(base_a4) | nucleo_set)
     if len(base_a4) > 50:
         rest = [d for d in base_a4 if d not in nucleo_set]
         rest.sort(key=lambda d: float(score_a4[d]), reverse=True)
         base_a4 = sorted(list(nucleo_set) + rest[: (50 - len(nucleo_set))])
-    elif len(base_a4) < 50:
-        fill = [d for d in range(100) if d not in set(base_a4)]
-        fill.sort(key=lambda d: float(score_a4[d]), reverse=True)
-        base_a4 = sorted(base_a4 + fill[: (50 - len(base_a4))])
+
+    # Garantia final de tamanho 50
+    def _ensure50(ap: list[int], score: np.ndarray):
+        s = set(ap)
+        if len(s) > 50:
+            # corta piores mantendo nucleo
+            keep = set(nucleo)
+            rest = [d for d in s if d not in keep]
+            rest.sort(key=lambda d: float(score[d]), reverse=True)
+            return sorted(list(keep) + rest[: (50 - len(keep))])
+        if len(s) < 50:
+            fill = [d for d in range(100) if d not in s]
+            fill.sort(key=lambda d: float(score[d]), reverse=True)
+            s.update(fill[: (50 - len(s))])
+        return sorted(list(s))
+
+    base_a1 = _ensure50(base_a1, score_a1)
+    base_a2 = _ensure50(base_a2, score_a2)
+    base_a3 = _ensure50(base_a3, score_a3)
+    base_a4 = _ensure50(base_a4, score_a4)
 
     apostas = [
         [int(x) for x in base_a1],
@@ -2557,24 +2574,46 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /bolao
     Gera 4 apostas (50 dezenas) com funções definidas (janela 50).
     Compatível com /avaliar e /confirmar porque salva também espelhos.
+    ✅ Agora varia a cada execução (seed variável + contador persistido).
     """
     try:
         history = load_history(HISTORY_PATH)
 
-        apostas, espelhos = gerar_apostas_bolao(history)
+        # Lê último estado (contador) do ULTIMA_GERACAO_PATH, se existir
+        bolao_run = 0
+        try:
+            if os.path.exists(ULTIMA_GERACAO_PATH):
+                with open(ULTIMA_GERACAO_PATH, "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+                if isinstance(prev, dict) and prev.get("modo") == "bolao":
+                    bolao_run = int(prev.get("bolao_run", 0))
+        except Exception:
+            bolao_run = 0
+
+        bolao_run += 1
+
+        user = update.effective_user
+        user_id = int(user.id) if user else 0
+
+        # Seed variável REAL (tempo + user + contador) -> muda toda execução
+        seed = (int(time.time() * 1000) ^ (user_id * 1315423911) ^ (bolao_run * 97531)) % 1_000_000
+        rng = np.random.default_rng(seed)
+
+        apostas, espelhos = gerar_apostas_bolao(history, rng=rng, bolao_run=bolao_run)
 
         apostas_py = [[int(x) for x in ap] for ap in apostas]
         espelhos_py = [[int(x) for x in esp] for esp in espelhos]
 
         # salva última geração (compat com /avaliar)
         try:
-            user = update.effective_user
             dados = {
                 "timestamp": float(time.time()),
                 "modo": "bolao",
+                "bolao_run": bolao_run,
+                "seed": int(seed),
                 "apostas": apostas_py,
                 "espelhos": espelhos_py,
-                "user_id": user.id if user else None,
+                "user_id": user_id,
             }
             with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
                 json.dump(dados, f, ensure_ascii=False, indent=2)
@@ -2585,7 +2624,7 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return " ".join(f"{d:02d}" for d in sorted(lista))
 
         linhas = []
-        linhas.append("🧠 /BOLAO — 4 APOSTAS (Janela 50) — Funções definidas")
+        linhas.append(f"🧠 /BOLAO — 4 APOSTAS (Janela 50) — Funções definidas | run={bolao_run} | seed={seed}")
         linhas.append("")
 
         labels = [
@@ -2597,9 +2636,9 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for i, (ap, esp) in enumerate(zip(apostas_py, espelhos_py), start=1):
             linhas.append(labels[i - 1])
-            linhas.append(fmt(ap))          # em linha reta
+            linhas.append(fmt(ap))
             linhas.append(f"Espelho {i}:")
-            linhas.append(fmt(esp))         # em linha reta (pra /avaliar manter padrão)
+            linhas.append(fmt(esp))
             linhas.append("")
 
         await update.message.reply_text("\n".join(linhas).strip())
@@ -2607,7 +2646,6 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Erro no comando /bolao")
         await update.message.reply_text(f"⚠️ Erro no /bolao: {e}")
-
 
 
 async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
