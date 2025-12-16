@@ -2293,6 +2293,319 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Erro ao gerar apostas: {e}")
 
 
+# ============================================================
+# /bolao — NOVO COMANDO (sem mexer no /gerar)
+# Janela: últimos 50 concursos
+# Saída: 4 apostas (50 dezenas) + espelhos (compat /avaliar)
+# ============================================================
+
+def _bolao_window(history, janela: int = 50):
+    if not history:
+        raise ValueError("Histórico vazio.")
+    return history[-janela:] if len(history) >= janela else history
+
+
+def _count_freq_and_delay(hist_window):
+    # freq: contagem nos concursos da janela
+    freq = np.zeros(100, dtype=np.int32)
+    for conc in hist_window:
+        for d in conc:
+            freq[d] += 1
+
+    # delay (atraso): quantos concursos desde a última aparição (na janela toda)
+    # delay menor = mais recente
+    delay = np.zeros(100, dtype=np.int32)
+    for d in range(100):
+        gap = 0
+        found = False
+        for conc in reversed(hist_window):
+            if d in conc:
+                found = True
+                break
+            gap += 1
+        delay[d] = gap if found else len(hist_window) + 5  # penaliza se não apareceu na janela
+
+    return freq, delay
+
+
+def _cooc_pairs(hist_window):
+    # cooc[i,j]: quantas vezes i e j saíram juntos na janela
+    cooc = np.zeros((100, 100), dtype=np.int16)
+    for conc in hist_window:
+        arr = sorted(conc)
+        for i in range(len(arr)):
+            a = arr[i]
+            for j in range(i + 1, len(arr)):
+                b = arr[j]
+                cooc[a, b] += 1
+                cooc[b, a] += 1
+    return cooc
+
+
+def _norm01(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    mn = float(x.min())
+    mx = float(x.max())
+    if mx - mn < 1e-9:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x - mn) / (mx - mn)
+
+
+def _choose_top(scores: np.ndarray, k: int, forbid: set[int] | None = None, rng=None) -> list[int]:
+    forbid = forbid or set()
+    idxs = [i for i in range(100) if i not in forbid]
+    # ordena por score desc; desempate por rng se fornecido
+    if rng is None:
+        idxs.sort(key=lambda i: float(scores[i]), reverse=True)
+    else:
+        # desempate leve com ruído muito pequeno só pra evitar empates travando
+        noise = rng.normal(0, 1e-6, size=100)
+        idxs.sort(key=lambda i: float(scores[i] + noise[i]), reverse=True)
+    return idxs[:k]
+
+
+def _stratified_pick(candidates: list[int], k: int, rng, bands=None) -> list[int]:
+    """
+    Seleção estratificada por faixa para evitar travar em um range só.
+    bands: lista de tuplas (ini, fim) inclusivo.
+    """
+    if bands is None:
+        bands = [(0, 19), (20, 39), (40, 59), (60, 79), (80, 99)]
+
+    cand_set = set(candidates)
+    buckets = []
+    for a, b in bands:
+        buckets.append([d for d in range(a, b + 1) if d in cand_set])
+
+    # tenta distribuir: 10 por faixa (5 faixas) quando k=50
+    target = [k // len(buckets)] * len(buckets)
+    rem = k - sum(target)
+    i = 0
+    while rem > 0:
+        target[i] += 1
+        rem -= 1
+        i = (i + 1) % len(target)
+
+    chosen = []
+    for bucket, t in zip(buckets, target):
+        if not bucket:
+            continue
+        rng.shuffle(bucket)
+        chosen.extend(bucket[:t])
+
+    # completa se faltou
+    if len(chosen) < k:
+        rest = [d for d in candidates if d not in set(chosen)]
+        rng.shuffle(rest)
+        chosen.extend(rest[: (k - len(chosen))])
+
+    # corta se passou
+    return sorted(chosen[:k])
+
+
+def gerar_apostas_bolao(history: list[set[int]]) -> tuple[list[list[int]], list[list[int]]]:
+    """
+    Gera 4 apostas (50 dezenas) com funções:
+      A1: Quentes + Puxadas (tendência)
+      A2: Alternância com viés para faixas altas (80–99) e pontes (60–79)
+      A3: Atrasadas/retorno (quebra de ciclo)
+      A4: Balanceada robusta (estratificada)
+    Retorna (apostas, espelhos)
+    """
+    hist_window = _bolao_window(history, 50)
+    freq, delay = _count_freq_and_delay(hist_window)
+    cooc = _cooc_pairs(hist_window)
+
+    freq_n = _norm01(freq)
+    # delay menor = melhor recência; vamos inverter para recency_n alto = recente
+    delay_n = _norm01(delay)
+    recency_n = 1.0 - delay_n
+
+    # seed determinística: usa o tamanho do histórico e a soma do último concurso
+    last = sorted(list(history[-1]))
+    seed = (len(history) * 1000 + sum(last) * 7) % 1_000_000
+    rng = np.random.default_rng(seed)
+
+    # -----------------------------
+    # Micro-núcleo (4 dezenas)
+    # score_nucleo privilegia presença + recência, com leve penalidade para “super quentes”
+    # -----------------------------
+    score_nucleo = (0.55 * freq_n) + (0.45 * recency_n) - (0.08 * (freq_n ** 2))
+    nucleo = _choose_top(score_nucleo, 4, rng=rng)
+    nucleo_set = set(nucleo)
+
+    # -----------------------------
+    # A1 — Quentes + Puxadas
+    # - começa com quentes (freq alta) e adiciona puxadas (cooc alta com núcleo+quentes)
+    # -----------------------------
+    hot = _choose_top(freq_n, 18, rng=rng)  # top 18 quentes
+    hot_set = set(hot) | nucleo_set
+
+    # puxadas: soma de cooc com hot_set
+    pull_score = np.zeros(100, dtype=np.float32)
+    for d in range(100):
+        pull_score[d] = float(np.sum(cooc[d, list(hot_set)])) if d not in hot_set else 0.0
+
+    pull_n = _norm01(pull_score)
+    score_a1 = (0.60 * freq_n) + (0.30 * pull_n) + (0.10 * recency_n)
+    base_a1 = sorted(set(_choose_top(score_a1, 50, rng=rng)) | nucleo_set)
+    # garante 50
+    if len(base_a1) > 50:
+        # corta os piores mantendo núcleo
+        keep = set(nucleo)
+        rest = [d for d in base_a1 if d not in keep]
+        rest.sort(key=lambda d: float(score_a1[d]), reverse=True)
+        base_a1 = sorted(list(keep) + rest[: (50 - len(keep))])
+    elif len(base_a1) < 50:
+        fill = [d for d in range(100) if d not in set(base_a1)]
+        fill.sort(key=lambda d: float(score_a1[d]), reverse=True)
+        base_a1 = sorted(base_a1 + fill[: (50 - len(base_a1))])
+
+    # -----------------------------
+    # A2 — Alternância com viés alto
+    # - favorece 60–99 + números com boa cooc e freq média/alta
+    # -----------------------------
+    band_bias = np.zeros(100, dtype=np.float32)
+    for d in range(100):
+        if d >= 80:
+            band_bias[d] = 1.0
+        elif d >= 60:
+            band_bias[d] = 0.65
+        elif d >= 40:
+            band_bias[d] = 0.25
+        else:
+            band_bias[d] = 0.10
+
+    pull2_score = np.zeros(100, dtype=np.float32)
+    for d in range(100):
+        pull2_score[d] = float(np.sum(cooc[d, nucleo])) if d not in nucleo_set else 0.0
+    pull2_n = _norm01(pull2_score)
+
+    score_a2 = (0.45 * freq_n) + (0.25 * pull2_n) + (0.10 * recency_n) + (0.20 * band_bias)
+    cand_a2 = _choose_top(score_a2, 75, rng=rng)  # candidatos fortes
+    # pega 50 estratificando, mas com faixa alta mais carregada
+    # usamos bandas com mais peso nas altas: duplicamos faixas altas via candidatos
+    base_a2 = _stratified_pick(cand_a2, 50, rng=rng, bands=[(0, 19), (20, 39), (40, 59), (60, 79), (80, 99)])
+    # garante núcleo dentro
+    base_a2 = sorted(set(base_a2) | nucleo_set)
+    if len(base_a2) > 50:
+        rest = [d for d in base_a2 if d not in nucleo_set]
+        rest.sort(key=lambda d: float(score_a2[d]), reverse=True)
+        base_a2 = sorted(list(nucleo_set) + rest[: (50 - len(nucleo_set))])
+    elif len(base_a2) < 50:
+        fill = [d for d in range(100) if d not in set(base_a2)]
+        fill.sort(key=lambda d: float(score_a2[d]), reverse=True)
+        base_a2 = sorted(base_a2 + fill[: (50 - len(base_a2))])
+
+    # -----------------------------
+    # A3 — Atrasadas/retorno (quebra)
+    # - privilegia delay alto (mais atrasadas), mas evita as totalmente “mortas” (freq muito baixa)
+    # -----------------------------
+    delay_hi = _norm01(delay)  # maior = mais atrasada
+    # penaliza as “mortas”: freq muito baixa
+    score_a3 = (0.65 * delay_hi) + (0.20 * (1.0 - freq_n)) + (0.15 * pull2_n)
+    # tira “super quentes” do topo da lista para quebrar ciclo
+    forbid_hot = set(_choose_top(freq_n, 10, rng=rng))
+    cand_a3 = _choose_top(score_a3, 80, forbid=forbid_hot, rng=rng)
+    base_a3 = _stratified_pick(cand_a3, 50, rng=rng)
+    base_a3 = sorted(set(base_a3) | nucleo_set)
+    if len(base_a3) > 50:
+        rest = [d for d in base_a3 if d not in nucleo_set]
+        rest.sort(key=lambda d: float(score_a3[d]), reverse=True)
+        base_a3 = sorted(list(nucleo_set) + rest[: (50 - len(nucleo_set))])
+    elif len(base_a3) < 50:
+        fill = [d for d in range(100) if d not in set(base_a3)]
+        fill.sort(key=lambda d: float(score_a3[d]), reverse=True)
+        base_a3 = sorted(base_a3 + fill[: (50 - len(base_a3))])
+
+    # -----------------------------
+    # A4 — Balanceada robusta (estratificada e sem travar faixa)
+    # - mistura freq+recency+puxadas, com seleção estratificada
+    # -----------------------------
+    score_a4 = (0.45 * freq_n) + (0.25 * recency_n) + (0.30 * pull2_n)
+    cand_a4 = _choose_top(score_a4, 80, rng=rng)
+    base_a4 = _stratified_pick(cand_a4, 50, rng=rng)
+    base_a4 = sorted(set(base_a4) | nucleo_set)
+    if len(base_a4) > 50:
+        rest = [d for d in base_a4 if d not in nucleo_set]
+        rest.sort(key=lambda d: float(score_a4[d]), reverse=True)
+        base_a4 = sorted(list(nucleo_set) + rest[: (50 - len(nucleo_set))])
+    elif len(base_a4) < 50:
+        fill = [d for d in range(100) if d not in set(base_a4)]
+        fill.sort(key=lambda d: float(score_a4[d]), reverse=True)
+        base_a4 = sorted(base_a4 + fill[: (50 - len(base_a4))])
+
+    apostas = [
+        [int(x) for x in base_a1],
+        [int(x) for x in base_a2],
+        [int(x) for x in base_a3],
+        [int(x) for x in base_a4],
+    ]
+
+    universo = set(range(100))
+    espelhos = [sorted(list(universo - set(ap))) for ap in apostas]
+
+    return apostas, espelhos
+
+
+async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /bolao
+    Gera 4 apostas (50 dezenas) com funções definidas (janela 50).
+    Compatível com /avaliar e /confirmar porque salva também espelhos.
+    """
+    try:
+        history = load_history(HISTORY_PATH)
+
+        apostas, espelhos = gerar_apostas_bolao(history)
+
+        apostas_py = [[int(x) for x in ap] for ap in apostas]
+        espelhos_py = [[int(x) for x in esp] for esp in espelhos]
+
+        # salva última geração (compat com /avaliar)
+        try:
+            user = update.effective_user
+            dados = {
+                "timestamp": float(time.time()),
+                "modo": "bolao",
+                "apostas": apostas_py,
+                "espelhos": espelhos_py,
+                "user_id": user.id if user else None,
+            }
+            with open(ULTIMA_GERACAO_PATH, "w", encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+        except Exception as e_save:
+            logger.exception(f"Erro ao salvar última geração (/bolao): {e_save}")
+
+        def fmt(lista):
+            return " ".join(f"{d:02d}" for d in sorted(lista))
+
+        linhas = []
+        linhas.append("🧠 /BOLAO — 4 APOSTAS (Janela 50) — Funções definidas")
+        linhas.append("")
+
+        labels = [
+            "✅ Aposta 1 — Quentes + Puxadas",
+            "✅ Aposta 2 — Alternância (viés alto)",
+            "✅ Aposta 3 — Retorno/Atrasadas (quebra)",
+            "✅ Aposta 4 — Balanceada robusta",
+        ]
+
+        for i, (ap, esp) in enumerate(zip(apostas_py, espelhos_py), start=1):
+            linhas.append(labels[i - 1])
+            linhas.append(fmt(ap))          # em linha reta
+            linhas.append(f"Espelho {i}:")
+            linhas.append(fmt(esp))         # em linha reta (pra /avaliar manter padrão)
+            linhas.append("")
+
+        await update.message.reply_text("\n".join(linhas).strip())
+
+    except Exception as e:
+        logger.exception("Erro no comando /bolao")
+        await update.message.reply_text(f"⚠️ Erro no /bolao: {e}")
+
+
+
 async def refino_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     COMANDO /refino - VERSÃO ULTRA-EFICIENTE
@@ -2432,7 +2745,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("treinar", treinar_cmd))
     app.add_handler(CommandHandler("gerar", gerar_cmd))
-    app.add_handler(CommandHandler("refino", refino_cmd))  # NOVO COMANDO
+    app.add_handler(CommandHandler("bolao", bolao_cmd))
+    app.add_handler(CommandHandler("refino", refino_cmd))  
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
     app.add_handler(CommandHandler("avaliar", avaliar_cmd))
     app.add_handler(CommandHandler("status_penalidades", status_penalidades_cmd))
