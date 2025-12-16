@@ -2313,7 +2313,17 @@ async def gerar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Janela: últimos 50 concursos
 # Saída: 4 apostas (50 dezenas) + espelhos (compat /avaliar)
 # Correção: VARIAÇÃO CONTROLADA por execução (seed variável + amostragem ponderada)
+#
+# ✅ MELHORIAS (Max eficiência):
+# 1) Recomenda automaticamente 4 bilhetes para jogar:
+#    -> Aposta 1 + Espelho 2 + Aposta 3 + Aposta 4
+#    -> Aposta 2 vira "DESCARTAR" (instável no seu histórico)
+# 2) Score interno (qualidade + diversidade) e marca JOGAR/DESCARTAR
+# 3) Aposta 2 "amansada": menos viés alto, penaliza overlap com A1, e estratifica
 # ============================================================
+
+BOLAO_HIDE_A2 = False  # Se True: não mostra Aposta 2 (mas mantém no JSON p/ /avaliar)
+BOLAO_SHOW_RECOMMENDATION = True  # Mostra bloco "🎯 RECOMENDAÇÃO (4 bilhetes)"
 
 def _bolao_window(history, janela: int = 50):
     if not history:
@@ -2393,7 +2403,6 @@ def _weighted_sample_no_replace(scores: np.ndarray, k: int, rng, forbid: set[int
     s = np.power(s, 1.0 / temperature)
 
     p = s / s.sum()
-
     k = int(min(k, idxs.size))
     chosen = rng.choice(idxs, size=k, replace=False, p=p)
     return [int(x) for x in chosen]
@@ -2435,15 +2444,10 @@ def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[l
     """
     Gera 4 apostas (50 dezenas) com funções:
       A1: Quentes + Puxadas (tendência)
-      A2: Alternância com viés alto (60–99)
+      A2: Alternância com viés alto (AMANSADA)
       A3: Atrasadas/retorno (quebra de ciclo)
       A4: Balanceada robusta (estratificada)
     Retorna (apostas, espelhos)
-
-    ✅ Agora varia a cada execução:
-    - seed variável (passado via rng)
-    - seleção ponderada na periferia (mantém lógica, mas gira dezenas)
-    - micro-núcleo estável e controlado
     """
     hist_window = _bolao_window(history, 50)
     freq, delay = _count_freq_and_delay(hist_window)
@@ -2455,14 +2459,13 @@ def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[l
     delay_hi = _norm01(delay)  # maior = mais atrasada
 
     # -----------------------------
-    # Micro-núcleo (4 dezenas) — ESTÁVEL (sem rng)
+    # Micro-núcleo (4 dezenas) — ESTÁVEL
     # -----------------------------
     score_nucleo = (0.55 * freq_n) + (0.45 * recency_n) - (0.08 * (freq_n ** 2))
     nucleo = _choose_top(score_nucleo, 4)
     nucleo_set = set(nucleo)
 
-    # Pequena rotação controlada do núcleo: 1 dezena pode girar a cada 3 execuções
-    # (mantém identidade, mas evita "congelar" pra sempre)
+    # rotação leve do núcleo (1 troca a cada 3 execuções)
     if bolao_run % 3 == 0:
         cand_nucleo = _choose_top(score_nucleo, 10, forbid=set(nucleo))
         if cand_nucleo:
@@ -2489,44 +2492,58 @@ def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[l
     # -----------------------------
     hot = set(_choose_top(freq_n, 18)) | nucleo_set
     pull_n = pull_from(hot)
-
     score_a1 = (0.60 * freq_n) + (0.30 * pull_n) + (0.10 * recency_n)
 
-    # fixa uma base “core” e gira o resto
-    core_a1 = set(_choose_top(score_a1, 28)) | nucleo_set  # 28 mais fortes
+    core_a1 = set(_choose_top(score_a1, 28)) | nucleo_set
     forbid_a1 = set(core_a1)
-    # gira 22 restantes por amostragem ponderada
     extra_a1 = _weighted_sample_no_replace(score_a1, 50 - len(core_a1), rng, forbid=forbid_a1, temperature=0.85)
     base_a1 = sorted(list(core_a1 | set(extra_a1)))
 
     # -----------------------------
-    # A2 — Alternância (viés alto) com rotação real
+    # A2 — Alternância (viés alto) AMANSADA + diversidade real
+    # - reduz viés 60–99 (menos extremo)
+    # - penaliza overlap com core da A1
+    # - força estratificação mínima
     # -----------------------------
     band_bias = np.zeros(100, dtype=np.float32)
     for d in range(100):
         if d >= 80:
-            band_bias[d] = 1.0
+            band_bias[d] = 0.60
         elif d >= 60:
-            band_bias[d] = 0.65
+            band_bias[d] = 0.45
         elif d >= 40:
             band_bias[d] = 0.25
         else:
-            band_bias[d] = 0.10
+            band_bias[d] = 0.20
 
     pull2_n = pull_from(nucleo_set)
-    score_a2 = (0.45 * freq_n) + (0.25 * pull2_n) + (0.10 * recency_n) + (0.20 * band_bias)
 
-    core_a2 = set(_choose_top(score_a2, 24)) | nucleo_set
+    # penalidade de overlap com A1 (pra A2 não virar "mais do mesmo")
+    overlap_pen = np.zeros(100, dtype=np.float32)
+    for d in core_a1:
+        overlap_pen[d] = 1.0
+
+    score_a2 = (0.42 * freq_n) + (0.23 * pull2_n) + (0.10 * recency_n) + (0.18 * band_bias) - (0.07 * overlap_pen)
+
+    core_a2 = set(_choose_top(score_a2, 22)) | nucleo_set
     forbid_a2 = set(core_a2)
-    extra_a2 = _weighted_sample_no_replace(score_a2, 50 - len(core_a2), rng, forbid=forbid_a2, temperature=0.95)
-    base_a2 = sorted(list(core_a2 | set(extra_a2)))
+    extra_a2 = _weighted_sample_no_replace(score_a2, 50 - len(core_a2), rng, forbid=forbid_a2, temperature=1.05)
+
+    # pool e estratificação mínima (evita A2 "viciar" no alto)
+    pool_a2 = sorted(list(set(core_a2) | set(extra_a2)))
+    # garante que há candidatos <60 no pool (se por algum motivo faltar)
+    if sum(1 for d in pool_a2 if d < 60) < 18:
+        low_cands = [d for d in _choose_top(score_a2, 60) if d < 60 and d not in set(pool_a2)]
+        pool_a2.extend(low_cands[: (18 - sum(1 for d in pool_a2 if d < 60))])
+        pool_a2 = sorted(list(set(pool_a2)))
+
+    base_a2 = _stratified_pick(pool_a2, 50, rng=rng)
 
     # -----------------------------
     # A3 — Atrasadas/retorno (quebra) com rotação real
     # -----------------------------
     score_a3 = (0.65 * delay_hi) + (0.20 * (1.0 - freq_n)) + (0.15 * pull2_n)
     forbid_hot = set(_choose_top(freq_n, 10))
-    # core da quebra (mais atrasadas que não sejam super quentes)
     core_candidates_a3 = [d for d in _choose_top(score_a3, 40) if d not in forbid_hot]
     core_a3 = set(core_candidates_a3[:22]) | nucleo_set
     forbid_a3 = set(core_a3) | forbid_hot
@@ -2537,7 +2554,6 @@ def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[l
     # A4 — Balanceada robusta (estratificada) + rotação
     # -----------------------------
     score_a4 = (0.45 * freq_n) + (0.25 * recency_n) + (0.30 * pull2_n)
-    # pega um pool grande via amostragem ponderada e depois estratifica
     pool_a4 = set(_choose_top(score_a4, 30)) | set(_weighted_sample_no_replace(score_a4, 60, rng, forbid=set(), temperature=0.95))
     pool_a4 = sorted(list(pool_a4 | nucleo_set))
     base_a4 = _stratified_pick(pool_a4, 50, rng=rng)
@@ -2551,7 +2567,6 @@ def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[l
     def _ensure50(ap: list[int], score: np.ndarray):
         s = set(ap)
         if len(s) > 50:
-            # corta piores mantendo nucleo
             keep = set(nucleo)
             rest = [d for d in s if d not in keep]
             rest.sort(key=lambda d: float(score[d]), reverse=True)
@@ -2585,7 +2600,10 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /bolao
     Gera 4 apostas (50 dezenas) com funções definidas (janela 50).
     Compatível com /avaliar e /confirmar porque salva também espelhos.
-    ✅ Agora varia a cada execução (seed variável + contador persistido).
+    ✅ Agora:
+      - RECOMENDA automaticamente 4 bilhetes: A1 + E2 + A3 + A4
+      - Marca A2 como DESCARTAR (instável no seu histórico)
+      - Mostra score interno (qualidade + diversidade)
     """
     try:
         history = load_history(HISTORY_PATH)
@@ -2606,7 +2624,7 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         user_id = int(user.id) if user else 0
 
-        # Seed variável REAL (tempo + user + contador) -> muda toda execução
+        # Seed variável REAL (tempo + user + contador)
         seed = (int(time.time() * 1000) ^ (user_id * 1315423911) ^ (bolao_run * 97531)) % 1_000_000
         rng = np.random.default_rng(seed)
 
@@ -2615,7 +2633,7 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         apostas_py = [[int(x) for x in ap] for ap in apostas]
         espelhos_py = [[int(x) for x in esp] for esp in espelhos]
 
-        # salva última geração (compat com /avaliar)
+        # salva última geração (compat com /avaliar /confirmar)
         try:
             dados = {
                 "timestamp": float(time.time()),
@@ -2634,18 +2652,77 @@ async def bolao_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         def fmt(lista):
             return " ".join(f"{d:02d}" for d in sorted(lista))
 
+        # -----------------------------
+        # SCORE interno (qualidade + diversidade)
+        # - qualidade: preferência por distribuição equilibrada (não “viciar” em 60–99)
+        # - diversidade: penaliza overlap com os 3 bilhetes recomendados
+        # -----------------------------
+        def _band_counts(nums: list[int]) -> tuple[int, int, int, int, int]:
+            b0 = sum(1 for d in nums if 0 <= d <= 19)
+            b1 = sum(1 for d in nums if 20 <= d <= 39)
+            b2 = sum(1 for d in nums if 40 <= d <= 59)
+            b3 = sum(1 for d in nums if 60 <= d <= 79)
+            b4 = sum(1 for d in nums if 80 <= d <= 99)
+            return b0, b1, b2, b3, b4
+
+        def _quality_score(nums: list[int]) -> float:
+            # ideal ~10 por banda (5 bandas, 50 dezenas)
+            b = _band_counts(nums)
+            # penaliza desbalanceamento e excesso extremo no topo
+            dev = sum(abs(x - 10) for x in b)
+            hi = b[3] + b[4]
+            # score maior = melhor
+            return float(100.0 - (dev * 2.2) - max(0, hi - 28) * 1.8)
+
+        def _overlap(a: list[int], b: list[int]) -> int:
+            return len(set(a) & set(b))
+
+        # Recomendação fixa pelo seu padrão real:
+        rec = {
+            "JOGAR 1": ("Aposta 1", apostas_py[0]),
+            "JOGAR 2": ("Espelho 2", espelhos_py[1]),   # substitui A2 por E2
+            "JOGAR 3": ("Aposta 3", apostas_py[2]),
+            "JOGAR 4": ("Aposta 4", apostas_py[3]),
+        }
+
+        # conjunto recomendado para medir diversidade
+        rec_lists = [v[1] for v in rec.values()]
+        rec_union = set().union(*[set(x) for x in rec_lists])
+
+        def _diversity_score(nums: list[int]) -> float:
+            # quanto menos overlap com o conjunto recomendado, mais “cobre cenário”
+            ov = len(set(nums) & rec_union)
+            # 50 números, então ov em [0..50]
+            return float(50 - ov)
+
+        # -----------------------------
+        # Montagem do texto
+        # -----------------------------
         linhas = []
         linhas.append(f"🧠 /BOLAO — 4 APOSTAS (Janela 50) — Funções definidas | run={bolao_run} | seed={seed}")
         linhas.append("")
 
+        if BOLAO_SHOW_RECOMMENDATION:
+            linhas.append("🎯 RECOMENDAÇÃO AUTOMÁTICA — 4 BILHETES (modo 4 jogos)")
+            for k, (nome, nums) in rec.items():
+                qs = _quality_score(nums)
+                ds = _diversity_score(nums)
+                linhas.append(f"✅ {k}: {nome}  | score={qs:.1f} | diversidade={ds:.1f}")
+            linhas.append("🚫 DESCARTAR: Aposta 2 — Alternância (viés alto)  (use o Espelho 2)")
+            linhas.append("")
+
         labels = [
             "✅ Aposta 1 — Quentes + Puxadas",
-            "✅ Aposta 2 — Alternância (viés alto)",
+            "🚫 Aposta 2 — Alternância (viés alto) [DESCARTAR — use Espelho 2]",
             "✅ Aposta 3 — Retorno/Atrasadas (quebra)",
             "✅ Aposta 4 — Balanceada robusta",
         ]
 
         for i, (ap, esp) in enumerate(zip(apostas_py, espelhos_py), start=1):
+            # opção de ocultar A2 na tela
+            if BOLAO_HIDE_A2 and i == 2:
+                continue
+
             linhas.append(labels[i - 1])
             linhas.append(fmt(ap))
             linhas.append(f"Espelho {i}:")
