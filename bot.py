@@ -1719,56 +1719,51 @@ def analisar_desempenho_historico(
     janela: int = 30,
 ):
     """
-    Lê o desempenho_oraculo.csv e calcula:
-    - índice interno de confiança ≥15
+    Lê desempenho_oraculo.csv (gerado pelo /confirmar) e calcula:
+    - índice interno de confiança ≥15 (baseado em melhor_hits)
     - sinal automático (aposta liberada ou não)
+    - modo dominante na janela (oraculo/refino/bolao) + distribuição
     """
-
     if not os.path.exists(path):
         return {
             "status": "SEM_DADOS",
-            "mensagem": "Nenhum histórico de desempenho encontrado.",
+            "mensagem": "Nenhum histórico de desempenho encontrado. Rode /confirmar pelo menos 1 vez.",
         }
 
-    registros = []
-
+    registros = []  # (melhor_hits, media_hits, modo)
     try:
         with open(path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter=";")
             for row in reader:
                 try:
-                    melhor = int(row.get("melhor_aposta", 0))
-                    media = float(row.get("media_lote", 0))
-                    registros.append((melhor, media))
+                    modo = (row.get("modo", "") or "").strip().lower()
+                    melhor_hits = int(float(row.get("melhor_hits", "0")))
+                    media_hits = float(str(row.get("media_hits", "0")).replace(",", "."))
+                    registros.append((melhor_hits, media_hits, modo))
                 except Exception:
                     continue
     except Exception as e:
-        logger.error(f"Erro ao ler desempenho: {e}")
-        return {
-            "status": "ERRO",
-            "mensagem": "Falha ao ler histórico de desempenho.",
-        }
+        logger.error(f"Erro ao ler {path}: {e}")
+        return {"status": "ERRO", "mensagem": "Falha ao ler histórico de desempenho."}
 
     if len(registros) < 5:
         return {
             "status": "POUCOS_DADOS",
-            "mensagem": "Histórico insuficiente para análise confiável.",
+            "mensagem": "Histórico insuficiente para análise confiável (mínimo 5 confirmações).",
         }
 
-    # ---------------------------------------------
-    # Aplica janela
-    # ---------------------------------------------
     dados = registros[-janela:]
     total = len(dados)
 
-    hits_15 = 0
-    hits_16 = 0
-    hits_17 = 0
+    hits_15 = hits_16 = hits_17 = 0
     medias = []
     sequencia_ruim = 0
     pior_sequencia = 0
 
-    for melhor, media in dados:
+    modos_validos = {"oraculo", "refino", "bolao"}
+    cont_modos = {"oraculo": 0, "refino": 0, "bolao": 0, "outros": 0}
+
+    for melhor, media, modo in dados:
         medias.append(media)
 
         if melhor >= 15:
@@ -1783,35 +1778,42 @@ def analisar_desempenho_historico(
         if melhor >= 17:
             hits_17 += 1
 
-    # ---------------------------------------------
-    # ÍNDICE INTERNO DE CONFIANÇA ≥15
-    # pesos progressivos
-    # ---------------------------------------------
-    indice_confianca = (
-        hits_15
-        + 2.0 * hits_16
-        + 3.0 * hits_17
-    ) / total
+        if modo in modos_validos:
+            cont_modos[modo] += 1
+        else:
+            cont_modos["outros"] += 1
 
+    indice_confianca = (hits_15 + 2.0 * hits_16 + 3.0 * hits_17) / total
     media_geral = sum(medias) / len(medias)
 
-    # ---------------------------------------------
-    # SINAL AUTOMÁTICO (CRITÉRIOS)
-    # ---------------------------------------------
-    sinal_ativo = True
-    motivos_bloqueio = []
+    # prioridade no desempate: oraculo > bolao > refino
+    ranking_modos = ["oraculo", "bolao", "refino"]
+    modo_dominante = max(ranking_modos, key=lambda m: (cont_modos[m], -ranking_modos.index(m)))
 
-    if hits_15 / total < 0.40:
+    def pct(x: int) -> float:
+        return (100.0 * x / total) if total > 0 else 0.0
+
+    dist_modos = {
+        "oraculo": round(pct(cont_modos["oraculo"]), 1),
+        "bolao": round(pct(cont_modos["bolao"]), 1),
+        "refino": round(pct(cont_modos["refino"]), 1),
+        "outros": round(pct(cont_modos["outros"]), 1),
+    }
+
+    sinal_ativo = True
+    motivos = []
+
+    if (hits_15 / total) < 0.40:
         sinal_ativo = False
-        motivos_bloqueio.append("Frequência de ≥15 abaixo de 40%")
+        motivos.append("Frequência de ≥15 abaixo de 40%")
 
     if pior_sequencia >= 5:
         sinal_ativo = False
-        motivos_bloqueio.append("Sequência longa sem desempenho (≥5 concursos)")
+        motivos.append("Sequência longa sem ≥15 (≥5 concursos)")
 
     if media_geral < 14.0:
         sinal_ativo = False
-        motivos_bloqueio.append("Média geral abaixo de 14.0")
+        motivos.append("Média geral abaixo de 14.0")
 
     return {
         "status": "OK",
@@ -1823,7 +1825,10 @@ def analisar_desempenho_historico(
         "hits_17": hits_17,
         "pior_sequencia": pior_sequencia,
         "sinal": "ATIVO" if sinal_ativo else "BLOQUEADO",
-        "motivos": motivos_bloqueio,
+        "motivos": motivos,
+        "modo_dominante": modo_dominante,
+        "dist_modos": dist_modos,
+        "cont_modos": cont_modos,
     }
 
 
@@ -1893,6 +1898,7 @@ async def status_penalidades_cmd(update: Update, context: ContextTypes.DEFAULT_T
     linhas.append(f"Decaimento por concurso: {(1-DECAIMENTO_PENALIDADE)*100:.1f}%")
     
     await update.message.reply_text("\n".join(linhas))
+    
 
 async def status_confianca_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = analisar_desempenho_historico()
@@ -1908,12 +1914,24 @@ async def status_confianca_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     linhas.append(f"Índice ≥15: {info['indice_confianca']}")
     linhas.append(f"Média geral: {info['media_geral']}")
     linhas.append("")
-    linhas.append(
-        f"≥15: {info['hits_15']} | ≥16: {info['hits_16']} | ≥17: {info['hits_17']}"
-    )
-    linhas.append(f"Pior sequência sem desempenho: {info['pior_sequencia']}")
+    linhas.append(f"≥15: {info['hits_15']} | ≥16: {info['hits_16']} | ≥17: {info['hits_17']}")
+    linhas.append(f"Pior sequência sem ≥15: {info['pior_sequencia']}")
     linhas.append("")
     linhas.append(f"🚦 SINAL: {info['sinal']}")
+
+    # ✅ MODO DOMINANTE
+    linhas.append("")
+    linhas.append("🧭 MODO DOMINANTE (janela):")
+    linhas.append(
+        f"• Dominante: {info['modo_dominante'].upper()} "
+        f"(oraculo={info['cont_modos']['oraculo']}, bolao={info['cont_modos']['bolao']}, refino={info['cont_modos']['refino']})"
+    )
+    linhas.append(
+        f"• Distribuição: oraculo {info['dist_modos']['oraculo']}% | "
+        f"bolao {info['dist_modos']['bolao']}% | "
+        f"refino {info['dist_modos']['refino']}% | "
+        f"outros {info['dist_modos']['outros']}%"
+    )
 
     if info["motivos"]:
         linhas.append("")
