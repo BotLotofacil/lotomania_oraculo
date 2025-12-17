@@ -1709,6 +1709,123 @@ def gerar_apostas_refino(
 
     return apostas_refino, espelhos_refino
 
+# =====================================================
+# ÍNDICE DE CONFIANÇA ≥15  +  SINAL AUTOMÁTICO DE APOSTA
+# (NÃO altera geração, treino ou penalidades)
+# =====================================================
+
+def analisar_desempenho_historico(
+    path: str = DESEMPENHO_PATH,
+    janela: int = 30,
+):
+    """
+    Lê o desempenho_oraculo.csv e calcula:
+    - índice interno de confiança ≥15
+    - sinal automático (aposta liberada ou não)
+    """
+
+    if not os.path.exists(path):
+        return {
+            "status": "SEM_DADOS",
+            "mensagem": "Nenhum histórico de desempenho encontrado.",
+        }
+
+    registros = []
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for row in reader:
+                try:
+                    melhor = int(row.get("melhor_aposta", 0))
+                    media = float(row.get("media_lote", 0))
+                    registros.append((melhor, media))
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.error(f"Erro ao ler desempenho: {e}")
+        return {
+            "status": "ERRO",
+            "mensagem": "Falha ao ler histórico de desempenho.",
+        }
+
+    if len(registros) < 5:
+        return {
+            "status": "POUCOS_DADOS",
+            "mensagem": "Histórico insuficiente para análise confiável.",
+        }
+
+    # ---------------------------------------------
+    # Aplica janela
+    # ---------------------------------------------
+    dados = registros[-janela:]
+    total = len(dados)
+
+    hits_15 = 0
+    hits_16 = 0
+    hits_17 = 0
+    medias = []
+    sequencia_ruim = 0
+    pior_sequencia = 0
+
+    for melhor, media in dados:
+        medias.append(media)
+
+        if melhor >= 15:
+            hits_15 += 1
+            sequencia_ruim = 0
+        else:
+            sequencia_ruim += 1
+            pior_sequencia = max(pior_sequencia, sequencia_ruim)
+
+        if melhor >= 16:
+            hits_16 += 1
+        if melhor >= 17:
+            hits_17 += 1
+
+    # ---------------------------------------------
+    # ÍNDICE INTERNO DE CONFIANÇA ≥15
+    # pesos progressivos
+    # ---------------------------------------------
+    indice_confianca = (
+        hits_15
+        + 2.0 * hits_16
+        + 3.0 * hits_17
+    ) / total
+
+    media_geral = sum(medias) / len(medias)
+
+    # ---------------------------------------------
+    # SINAL AUTOMÁTICO (CRITÉRIOS)
+    # ---------------------------------------------
+    sinal_ativo = True
+    motivos_bloqueio = []
+
+    if hits_15 / total < 0.40:
+        sinal_ativo = False
+        motivos_bloqueio.append("Frequência de ≥15 abaixo de 40%")
+
+    if pior_sequencia >= 5:
+        sinal_ativo = False
+        motivos_bloqueio.append("Sequência longa sem desempenho (≥5 concursos)")
+
+    if media_geral < 14.0:
+        sinal_ativo = False
+        motivos_bloqueio.append("Média geral abaixo de 14.0")
+
+    return {
+        "status": "OK",
+        "janela": total,
+        "indice_confianca": round(indice_confianca, 3),
+        "media_geral": round(media_geral, 2),
+        "hits_15": hits_15,
+        "hits_16": hits_16,
+        "hits_17": hits_17,
+        "pior_sequencia": pior_sequencia,
+        "sinal": "ATIVO" if sinal_ativo else "BLOQUEADO",
+        "motivos": motivos_bloqueio,
+    }
+
 
 # ----------------------------------------------------
 # HANDLERS TELEGRAM
@@ -1728,6 +1845,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(RESTRITO à whitelist)\n"
         "/avaliar - apenas confirma os acertos das apostas (SEM treinar o modelo)\n"
         "/status_penalidades - mostra as dezenas mais penalizadas/recompensadas\n\n"
+        "/status_confianca - mostra índice ≥15 e sinal automático de aposta\n"
         "🎯 DIFERENÇAS ENTRE MODOS:\n"
         "• /gerar: Versão tradicional orientada a acertos diretos\n"
         "• /bolao: Estratégia estatística com núcleo fixo e rotações inteligentes\n"
@@ -1774,6 +1892,35 @@ async def status_penalidades_cmd(update: Update, context: ContextTypes.DEFAULT_T
     linhas.append(f"Penalidade máxima configurada: {MAX_PENALIDADE}")
     linhas.append(f"Decaimento por concurso: {(1-DECAIMENTO_PENALIDADE)*100:.1f}%")
     
+    await update.message.reply_text("\n".join(linhas))
+
+async def status_confianca_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = analisar_desempenho_historico()
+
+    if info.get("status") != "OK":
+        await update.message.reply_text(f"⚠️ {info.get('mensagem')}")
+        return
+
+    linhas = []
+    linhas.append("📊 STATUS DE CONFIANÇA – ORÁCULO LOTOMANIA")
+    linhas.append("")
+    linhas.append(f"Janela analisada: {info['janela']} concursos")
+    linhas.append(f"Índice ≥15: {info['indice_confianca']}")
+    linhas.append(f"Média geral: {info['media_geral']}")
+    linhas.append("")
+    linhas.append(
+        f"≥15: {info['hits_15']} | ≥16: {info['hits_16']} | ≥17: {info['hits_17']}"
+    )
+    linhas.append(f"Pior sequência sem desempenho: {info['pior_sequencia']}")
+    linhas.append("")
+    linhas.append(f"🚦 SINAL: {info['sinal']}")
+
+    if info["motivos"]:
+        linhas.append("")
+        linhas.append("Motivos de bloqueio:")
+        for m in info["motivos"]:
+            linhas.append(f"- {m}")
+
     await update.message.reply_text("\n".join(linhas))
 
 
@@ -2891,6 +3038,7 @@ def main():
     app.add_handler(CommandHandler("confirmar", confirmar_cmd))
     app.add_handler(CommandHandler("avaliar", avaliar_cmd))
     app.add_handler(CommandHandler("status_penalidades", status_penalidades_cmd))
+    app.add_handler(CommandHandler("status_confianca", status_confianca_cmd))
 
     logger.info("Bot Lotomania (Sistema Inteligente com Penalidades) iniciado.")
     logger.info("NOVO comando /refino disponível - Versão ULTRA-EFICIENTE")
