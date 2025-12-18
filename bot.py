@@ -1284,6 +1284,181 @@ def gerar_apostas_oraculo_supremo(
                 apostas[idx_anchor] = aposta_ancorada
 
     # ====================================================
+    #   FILTRO FINAL ESTRUTURAL (pós-processamento)
+    #   - NÃO escolhe dezenas "mágicas": só ajusta COMPOSIÇÃO
+    #   - Trocas mínimas guiadas pelo score de cada estratégia
+    #   - Preserva a ANCORAGEM (trava as dezenas fixas quando houver)
+    #
+    # Regras (para 50 dezenas):
+    # - Pares: 23 a 27
+    # - Múltiplos de 3: 15 a 18
+    # - Fibonacci: 6 a 10
+    # ====================================================
+
+    FIBO_SET = {0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89}
+
+    EVEN_MIN, EVEN_MAX = 23, 27
+    M3_MIN, M3_MAX = 15, 18
+    FIBO_MIN, FIBO_MAX = 6, 10
+
+    def _count_even(nums):
+        return sum(1 for d in nums if d % 2 == 0)
+
+    def _count_mult3(nums):
+        return sum(1 for d in nums if d % 3 == 0)
+
+    def _count_fibo(nums):
+        return sum(1 for d in nums if d in FIBO_SET)
+
+    def _ensure50_set(s, score_vec):
+        # garante 50 sem alterar o estilo: remove piores, adiciona melhores (fora do set)
+        if len(s) > 50:
+            # remove os de menor score
+            rest = sorted(list(s), key=lambda d: float(score_vec[d]))
+            return set(rest[-50:])
+        if len(s) < 50:
+            # adiciona os melhores fora do set
+            add = [d for d in np.argsort(-score_vec) if int(d) not in s]
+            need = 50 - len(s)
+            for d in add[:need]:
+                s.add(int(d))
+        return s
+
+    def _final_filter_structural(nums, score_vec, locked_set):
+        s = set(int(x) for x in nums)
+        s = _ensure50_set(s, score_vec)
+
+        evens_all = [d for d in range(100) if d % 2 == 0]
+        odds_all = [d for d in range(100) if d % 2 == 1]
+        mult3_all = [d for d in range(100) if d % 3 == 0]
+        nonmult3_all = [d for d in range(100) if d % 3 != 0]
+        fibo_all = list(FIBO_SET)
+        nonfibo_all = [d for d in range(100) if d not in FIBO_SET]
+
+        def best_add(cands):
+            cands = [d for d in cands if d not in s]
+            if not cands:
+                return None
+            cands.sort(key=lambda d: float(score_vec[d]), reverse=True)
+            return cands[0]
+
+        def worst_remove(cands):
+            cands = [d for d in cands if d in s and d not in locked_set]
+            if not cands:
+                return None
+            cands.sort(key=lambda d: float(score_vec[d]))  # menor score sai primeiro
+            return cands[0]
+
+        for _ in range(160):
+            cur = sorted(s)
+            ev = _count_even(cur)
+            m3 = _count_mult3(cur)
+            fb = _count_fibo(cur)
+
+            if (EVEN_MIN <= ev <= EVEN_MAX) and (M3_MIN <= m3 <= M3_MAX) and (FIBO_MIN <= fb <= FIBO_MAX):
+                break
+
+            # pares/ímpares
+            if ev > EVEN_MAX:
+                out = worst_remove([d for d in s if d % 2 == 0])
+                inn = best_add(odds_all)
+                if out is not None and inn is not None:
+                    s.remove(out); s.add(inn); continue
+
+            if ev < EVEN_MIN:
+                out = worst_remove([d for d in s if d % 2 == 1])
+                inn = best_add(evens_all)
+                if out is not None and inn is not None:
+                    s.remove(out); s.add(inn); continue
+
+            # múltiplos de 3
+            if m3 > M3_MAX:
+                out = worst_remove([d for d in s if d % 3 == 0])
+                inn = best_add(nonmult3_all)
+                if out is not None and inn is not None:
+                    s.remove(out); s.add(inn); continue
+
+            if m3 < M3_MIN:
+                out = worst_remove([d for d in s if d % 3 != 0])
+                inn = best_add(mult3_all)
+                if out is not None and inn is not None:
+                    s.remove(out); s.add(inn); continue
+
+            # fibonacci
+            if fb > FIBO_MAX:
+                out = worst_remove([d for d in s if d in FIBO_SET])
+                inn = best_add(nonfibo_all)
+                if out is not None and inn is not None:
+                    s.remove(out); s.add(inn); continue
+
+            if fb < FIBO_MIN:
+                out = worst_remove([d for d in s if d not in FIBO_SET])
+                inn = best_add(fibo_all)
+                if out is not None and inn is not None:
+                    s.remove(out); s.add(inn); continue
+
+            # fallback: troca neutra (se travar por locked)
+            removable = [d for d in s if d not in locked_set]
+            if not removable:
+                break
+            removable.sort(key=lambda d: float(score_vec[d]))
+            out = removable[0]
+            candidates = [d for d in range(100) if d not in s]
+            candidates.sort(key=lambda d: float(score_vec[d]), reverse=True)
+            inn = candidates[0] if candidates else None
+            if inn is None:
+                break
+            s.remove(out); s.add(inn)
+
+        # garante locked e 50
+        s |= set(locked_set)
+
+        if len(s) > 50:
+            # remove apenas fora do locked
+            removable = [d for d in s if d not in locked_set]
+            removable.sort(key=lambda d: float(score_vec[d]))  # piores primeiro
+            while len(s) > 50 and removable:
+                s.remove(removable.pop(0))
+
+        if len(s) < 50:
+            # adiciona melhores fora do set
+            add = [int(d) for d in np.argsort(-score_vec) if int(d) not in s]
+            need = 50 - len(s)
+            for d in add[:need]:
+                s.add(int(d))
+
+        return sorted(list(s))
+
+    # score vetorial por estratégia (guia as trocas)
+    score1 = probs.astype(np.float64)                 # aposta 1: top probs reais
+    score2 = ciclo_score.astype(np.float64)           # aposta 2: ciclos
+    score3 = probs_temp.astype(np.float64)            # aposta 3: probs com ruído/tempering
+    score4 = score_hibrido.astype(np.float64)         # aposta 4: híbrida
+    score5 = quente_score.astype(np.float64)          # aposta 5: quentes
+    score6 = frias_score.astype(np.float64)           # aposta 6: frias
+
+    # trava somente a parte fixa da ancoragem, se estiver ativa
+    locked_sets = [set(), set(), set(), set(), set(), set()]
+    if best_hits >= 15 and isinstance(best_pattern, list) and len(best_pattern) >= 10:
+        idx_anchor = best_ap_index - 1
+        if 0 <= idx_anchor < 6:
+            # recomputa o mesmo conjunto fixo usado na ancoragem (70% do pattern ordenado por prob)
+            campea = sorted({int(d) for d in best_pattern if 0 <= int(d) <= 99})
+            if len(campea) > 0:
+                n_fixo = min(len(campea), int(round(50 * 0.70)))
+                campea_ordenada = sorted(campea, key=lambda d: probs[d], reverse=True)
+                fixas_set = set(campea_ordenada[:n_fixo])
+                locked_sets[idx_anchor] = fixas_set
+
+    apostas[0] = _final_filter_structural(apostas[0], score1, locked_sets[0])
+    apostas[1] = _final_filter_structural(apostas[1], score2, locked_sets[1])
+    apostas[2] = _final_filter_structural(apostas[2], score3, locked_sets[2])
+    apostas[3] = _final_filter_structural(apostas[3], score4, locked_sets[3])
+    apostas[4] = _final_filter_structural(apostas[4], score5, locked_sets[4])
+    apostas[5] = _final_filter_structural(apostas[5], score6, locked_sets[5])
+
+
+    # ====================================================
     #   ESPELHOS
     # ====================================================
     universo = set(range(100))
