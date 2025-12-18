@@ -23,7 +23,7 @@ from telegram.ext import (
 # BLOQUEIO TOTAL GLOBAL (BLACKLIST)
 # ================================
 
-BLOCKED_USERS = {}  # user_id bloqueado
+BLOCKED_USERS = {848572364}  # user_id bloqueado
 
 
 # ----------------------------------------------------
@@ -1898,7 +1898,7 @@ async def status_penalidades_cmd(update: Update, context: ContextTypes.DEFAULT_T
     linhas.append(f"Decaimento por concurso: {(1-DECAIMENTO_PENALIDADE)*100:.1f}%")
     
     await update.message.reply_text("\n".join(linhas))
-    
+
 
 async def status_confianca_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = analisar_desempenho_historico()
@@ -2746,6 +2746,155 @@ def gerar_apostas_bolao(history: list[set[int]], rng, bolao_run: int) -> tuple[l
     base_a2 = _ensure50(base_a2, score_a2)
     base_a3 = _ensure50(base_a3, score_a3)
     base_a4 = _ensure50(base_a4, score_a4)
+
+    # ============================================================
+    # FILTRO FINAL ESTRUTURAL (sem mexer no núcleo)
+    # - Ajusta COMPOSIÇÃO da aposta (não escolhe dezenas "mágicas")
+    # - Mantém nucleo_set intacto
+    # - Trocas mínimas guiadas pelo score da própria aposta
+    #
+    # Regras (para 50 dezenas):
+    # - Pares: 23 a 27
+    # - Múltiplos de 3: 15 a 18
+    # - Fibonacci: 6 a 10
+    # ============================================================
+
+    FIBO_SET = {0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89}
+
+    def _count_even(nums: list[int]) -> int:
+        return sum(1 for d in nums if d % 2 == 0)
+
+    def _count_mult3(nums: list[int]) -> int:
+        return sum(1 for d in nums if d % 3 == 0)
+
+    def _count_fibo(nums: list[int]) -> int:
+        return sum(1 for d in nums if d in FIBO_SET)
+
+    def _final_filter_structural(nums: list[int], score: np.ndarray, rng, locked: set[int]) -> list[int]:
+        """
+        Ajusta a composição por swaps mínimos, preservando 'locked' (nucleo_set).
+        Estratégia:
+          - Se uma métrica está acima do teto, remove candidatos fora de locked com menor score daquele grupo.
+          - Se está abaixo do piso, adiciona candidatos com maior score daquele grupo.
+        """
+        s = set(nums)
+        if len(s) != 50:
+            s = set(_ensure50(sorted(s), score))
+
+        # limites
+        EVEN_MIN, EVEN_MAX = 23, 27
+        M3_MIN, M3_MAX = 15, 18
+        FIBO_MIN, FIBO_MAX = 6, 10
+
+        def _best_add(cands: list[int]) -> int | None:
+            cands = [d for d in cands if d not in s]
+            if not cands:
+                return None
+            cands.sort(key=lambda d: float(score[d]), reverse=True)
+            return cands[0]
+
+        def _worst_remove(cands: list[int]) -> int | None:
+            cands = [d for d in cands if d in s and d not in locked]
+            if not cands:
+                return None
+            cands.sort(key=lambda d: float(score[d]))  # menor score primeiro
+            return cands[0]
+
+        # pré-listas por propriedade
+        evens_all = [d for d in range(100) if d % 2 == 0]
+        odds_all = [d for d in range(100) if d % 2 == 1]
+        mult3_all = [d for d in range(100) if d % 3 == 0]
+        nonmult3_all = [d for d in range(100) if d % 3 != 0]
+        fibo_all = list(FIBO_SET)
+        nonfibo_all = [d for d in range(100) if d not in FIBO_SET]
+
+        # loop de ajustes (limitado)
+        for _ in range(160):
+            cur = sorted(s)
+            ev = _count_even(cur)
+            m3 = _count_mult3(cur)
+            fb = _count_fibo(cur)
+
+            ok = (EVEN_MIN <= ev <= EVEN_MAX) and (M3_MIN <= m3 <= M3_MAX) and (FIBO_MIN <= fb <= FIBO_MAX)
+            if ok:
+                break
+
+            # 1) Ajuste de pares/ímpares
+            if ev > EVEN_MAX:
+                out = _worst_remove([d for d in s if d % 2 == 0])
+                if out is not None:
+                    # precisa colocar ímpar para reduzir evens
+                    inn = _best_add(odds_all)
+                    if inn is not None:
+                        s.remove(out); s.add(inn)
+                        continue
+
+            if ev < EVEN_MIN:
+                out = _worst_remove([d for d in s if d % 2 == 1])
+                if out is not None:
+                    inn = _best_add(evens_all)
+                    if inn is not None:
+                        s.remove(out); s.add(inn)
+                        continue
+
+            # 2) Ajuste de múltiplos de 3
+            if m3 > M3_MAX:
+                out = _worst_remove([d for d in s if d % 3 == 0])
+                if out is not None:
+                    inn = _best_add(nonmult3_all)
+                    if inn is not None:
+                        s.remove(out); s.add(inn)
+                        continue
+
+            if m3 < M3_MIN:
+                out = _worst_remove([d for d in s if d % 3 != 0])
+                if out is not None:
+                    inn = _best_add(mult3_all)
+                    if inn is not None:
+                        s.remove(out); s.add(inn)
+                        continue
+
+            # 3) Ajuste de Fibonacci
+            if fb > FIBO_MAX:
+                out = _worst_remove([d for d in s if d in FIBO_SET])
+                if out is not None:
+                    inn = _best_add(nonfibo_all)
+                    if inn is not None:
+                        s.remove(out); s.add(inn)
+                        continue
+
+            if fb < FIBO_MIN:
+                out = _worst_remove([d for d in s if d not in FIBO_SET])
+                if out is not None:
+                    inn = _best_add(fibo_all)
+                    if inn is not None:
+                        s.remove(out); s.add(inn)
+                        continue
+
+            # fallback (se travar por locked): pequena rotação neutra guiada por score
+            # remove pior (fora locked) e adiciona melhor global (fora)
+            removable = [d for d in s if d not in locked]
+            if not removable:
+                break
+            removable.sort(key=lambda d: float(score[d]))
+            out = removable[0]
+            candidates = [d for d in range(100) if d not in s]
+            candidates.sort(key=lambda d: float(score[d]), reverse=True)
+            inn = candidates[0] if candidates else None
+            if inn is None:
+                break
+            s.remove(out); s.add(inn)
+
+        # garante núcleo e tamanho 50
+        s |= set(locked)
+        final = _ensure50(sorted(s), score)
+        return final
+
+    # aplica filtro final nas 4 apostas (sem mexer no núcleo)
+    base_a1 = _final_filter_structural(base_a1, score_a1, rng, locked=nucleo_set)
+    base_a2 = _final_filter_structural(base_a2, score_a2, rng, locked=nucleo_set)
+    base_a3 = _final_filter_structural(base_a3, score_a3, rng, locked=nucleo_set)
+    base_a4 = _final_filter_structural(base_a4, score_a4, rng, locked=nucleo_set)
 
     apostas = [
         [int(x) for x in base_a1],
