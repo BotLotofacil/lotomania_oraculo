@@ -23,7 +23,7 @@ from telegram.ext import (
 # BLOQUEIO TOTAL GLOBAL (BLACKLIST)
 # ================================
 
-BLOCKED_USERS = {}  # user_id bloqueado
+BLOCKED_USERS = {848572364}  # user_id bloqueado
 
 
 # ----------------------------------------------------
@@ -54,11 +54,15 @@ PENALIDADES_PATH = "penalidades_oraculo.json"
 INTENSIVE_LEARNING = True  # deixar True para modo agressivo de treino
 TREINO_HABILITADO = True  # Flag global: se False, /confirmar só valida acertos (não treina o modelo)
 
-# Configurações de penalidade
-PENALIDADE_ERRO = 0.3  # Penalidade por escolher dezena que saiu (0.0 a 1.0)
-RECOMPENSA_ACERTO_ERRAR = 0.2  # Recompensa por escolher dezena que NÃO saiu
-MAX_PENALIDADE = 3.0  # Penalidade máxima acumulada
-DECAIMENTO_PENALIDADE = 0.95  # Decaimento das penalidades a cada concurso (95%)
+# Configurações de penalidade (v2 – alinhadas ao objetivo de ACERTAR)
+# Ideia: penalidades funcionam como um BIAS por dezena que entra no score do /gerar.
+#   • valor > 0  => favorece a dezena
+#   • valor < 0  => desfavorece a dezena
+PENALIDADE_ERRO = 0.30      # penaliza dezenas ESCOLHIDAS que NÃO saíram
+BONUS_ACERTO = 0.20        # bonifica dezenas ESCOLHIDAS que saíram
+MAX_PENALIDADE = 3.0       # limite do bias acumulado
+DECAIMENTO_PENALIDADE = 0.95  # esquecimento gradual
+
 
 # hiperparâmetros base (modo normal)
 BASE_CONV_CHANNELS = 8
@@ -90,9 +94,9 @@ _penalidades_cache: Dict[int, float] = None
 
 def carregar_penalidades() -> Dict[int, float]:
     """
-    Carrega as penalidades acumuladas por dezena.
-    Penalidade positiva = dezena que TEM saído (deve ser evitada)
-    Penalidade negativa = dezena que NÃO tem saído (deve ser preferida)
+    Carrega o BIAS acumulado por dezena (aprendizado).
+    > 0 favorece a dezena; < 0 desfavorece.
+    (v2) O ajuste é aplicado APENAS com base na melhor aposta do lote confirmado (não global).
     """
     global _penalidades_cache
     
@@ -135,51 +139,61 @@ def salvar_penalidades(penalidades: Dict[int, float]):
     except Exception as e:
         logger.error(f"Erro ao salvar penalidades: {e}")
 
-def aplicar_penalidades_apos_resultado(resultado_set: Set[int], modo: str = "errar_tudo"):
+def aplicar_penalidades_apos_resultado(
+    resultado_set: Set[int],
+    modo: str = "oraculo",
+    aposta_set: Set[int] | None = None,
+):
+    """(v2) Atualiza penalidades/bias após um resultado.
+
+    IMPORTANTÍSSIMO (correção):
+    - A penalidade NÃO pode ser aplicada em todas as 100 dezenas só porque "não saiu".
+      Isso destrói o sinal do aprendizado.
+    - Aqui a atualização é feita com base em UMA aposta de referência (aposta_set),
+      que por padrão deve ser a melhor aposta do último lote confirmado.
+
+    Semântica do bias:
+      - modo='oraculo':
+          * dezenas da aposta que SAÍRAM => +BONUS_ACERTO
+          * dezenas da aposta que NÃO saíram => -PENALIDADE_ERRO
+      - modo='errar_tudo' (se você ainda usar em algum fluxo antigo):
+          * dezenas da aposta que SAÍRAM => -PENALIDADE_ERRO
+          * dezenas da aposta que NÃO saíram => +BONUS_ACERTO
+
+    Observação: se aposta_set=None, não atualiza (para evitar o comportamento antigo global).
     """
-    Aplica penalidades após um resultado:
-    - Penaliza dezenas que SAÍRAM no resultado (se estamos tentando errar)
-    - Recompensa dezenas que NÃO saíram (se estamos tentando errar)
-    
-    O contrário para modo normal (oraculo).
-    """
+    if aposta_set is None:
+        logger.warning("Penalidades NÃO atualizadas: aposta_set=None (evitando update global por resultado).")
+        return
+
     penalidades = carregar_penalidades()
-    
-    todas_dezenas = set(range(100))
-    dezenas_nao_sairam = todas_dezenas - resultado_set
-    
+    aposta_set = {int(d) for d in aposta_set if 0 <= int(d) <= 99}
+
+    hits = aposta_set.intersection(resultado_set)
+    misses = aposta_set.difference(resultado_set)
+
     if modo == "errar_tudo" or modo == "refino":
-        # MODE ERRAR_TUDO / REFINO:
-        # Penaliza dezenas que SAÍRAM (erramos ao escolhê-las)
-        # Recompensa dezenas que NÃO saíram (acertamos em não escolhê-las)
-        for dezena in resultado_set:
-            penalidades[dezena] += PENALIDADE_ERRO
-            # Limita a penalidade máxima
-            penalidades[dezena] = min(penalidades[dezena], MAX_PENALIDADE)
-        
-        for dezena in dezenas_nao_sairam:
-            penalidades[dezena] -= RECOMPENSA_ACERTO_ERRAR
-            penalidades[dezena] = max(penalidades[dezena], -MAX_PENALIDADE)
-    
+        # objetivo: evitar as dezenas que saíram
+        for d in hits:
+            penalidades[d] = float(penalidades.get(d, 0.0)) - PENALIDADE_ERRO
+        for d in misses:
+            penalidades[d] = float(penalidades.get(d, 0.0)) + BONUS_ACERTO
     else:
-        # MODO ORACULO (tentar acertar):
-        # Penaliza dezenas que NÃO saíram (erramos ao escolhê-las)
-        # Recompensa dezenas que SAÍRAM (acertamos em escolhê-las)
-        for dezena in dezenas_nao_sairam:
-            penalidades[dezena] += PENALIDADE_ERRO * 0.5  # Penalidade menor para modo normal
-        
-        for dezena in resultado_set:
-            penalidades[dezena] -= RECOMPENSA_ACERTO_ERRAR * 0.5
-    
-    # Aplica decaimento para todas as penalidades (esquece lentamente)
-    for dezena in list(penalidades.keys()):
-        penalidades[dezena] *= DECAIMENTO_PENALIDADE
-        # Remove penalidades muito pequenas
-        if abs(penalidades[dezena]) < 0.01:
-            del penalidades[dezena]
-    
+        # objetivo: acertar
+        for d in hits:
+            penalidades[d] = float(penalidades.get(d, 0.0)) + BONUS_ACERTO
+        for d in misses:
+            penalidades[d] = float(penalidades.get(d, 0.0)) - PENALIDADE_ERRO
+
+    # clamp + decaimento
+    for d in list(penalidades.keys()):
+        penalidades[d] = max(-MAX_PENALIDADE, min(MAX_PENALIDADE, float(penalidades[d])))
+        penalidades[d] *= DECAIMENTO_PENALIDADE
+        if abs(penalidades[d]) < 0.01:
+            del penalidades[d]
+
     salvar_penalidades(penalidades)
-    logger.info(f"Penalidades aplicadas após resultado (modo: {modo})")
+    logger.info("Penalidades/bias atualizados com base na aposta de referência (modo=%s).", modo)
 
 def aplicar_decaimento_penalidades():
     """
@@ -195,9 +209,9 @@ def aplicar_decaimento_penalidades():
 
 def obter_score_com_penalidades(scores_base: np.ndarray) -> np.ndarray:
     """
-    Ajusta os scores base com as penalidades.
-    Para modo errar_tudo: scores_ajustados = scores_base + penalidades
-    (penalidades positivas aumentam o score = mais chance de ser escolhida para errar)
+    (v2) Ajusta os scores base com o bias aprendido (penalidades).
+    Semântica: valor > 0 favorece a dezena; valor < 0 desfavorece.
+    scores_ajustados = scores_base + bias
     """
     penalidades = carregar_penalidades()
     
@@ -908,7 +922,10 @@ def gerar_apostas_e_espelhos(history: List[Set[int]], model: ModelWrapper):
 
 
 def treino_incremental_pos_concurso(
-    history: List[Set[int]], resultado_set: set[int], modo: str = "oraculo"
+    history: List[Set[int]],
+    resultado_set: set[int],
+    modo: str = "oraculo",
+    aposta_ref: Set[int] | None = None,
 ):
     """
     Treino incremental pós-concurso COM APRENDIZADO DE PENALIDADES (VERSÃO CORRIGIDA).
@@ -1004,7 +1021,7 @@ def treino_incremental_pos_concurso(
     # ------------------------------------------------
     # APLICA PENALIDADES APÓS O TREINO
     # ------------------------------------------------
-    aplicar_penalidades_apos_resultado(resultado_set, modo)
+    aplicar_penalidades_apos_resultado(resultado_set, modo, aposta_set=aposta_ref)
 
     # Salva e atualiza cache
     save_model(wrapper)
@@ -1019,450 +1036,99 @@ def treino_incremental_pos_concurso(
     )
 
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x)
+    e = np.exp(x)
+    s = e.sum()
+    return e / s if s > 0 else np.full_like(x, 1.0 / len(x))
+
+
 def gerar_apostas_oraculo_supremo(
     history: List[Set[int]], model: ModelWrapper
 ):
     """
-    Oráculo Supremo – 6 apostas totalmente independentes e diversificadas:
-      1 – Repetição inteligente (poucas repetidas + top prob)
-      2 – Ciclos (atraso forte + probabilidade)
-      3 – Probabilística real (amostragem nas probs com ruído)
-      4 – Híbrida (CNN/MLP + freq + ciclos, evitando reuso)
-      5 – Quentes (multi-janela 10/30/200)
-      6 – Frias (baixa freq + atraso alto, evitando reuso)
+    Oráculo Supremo (v2) – 100% AI-first:
+    - Base: probabilidades do modelo híbrido (CNN+MLP)
+    - Ajuste: "bias" aprendido por dezenas (penalidades) aplicado APENAS com base
+      na melhor aposta do último lote confirmado
+    - Geração: 6 bilhetes com (i) exploração (top prob) e (ii) diversidade controlada
+
+    Retorna: (apostas, espelhos)
+      - apostas: 6 listas com 50 dezenas
+      - espelhos: complemento em 00–99
     """
 
     if len(history) < 5:
-        raise ValueError("Histórico insuficiente para Oráculo Supremo.")
+        raise ValueError("Histórico insuficiente para gerar apostas.")
 
-    # ====================================================
-    #   PROBABILIDADES DA REDE – NORMALIZADAS (base)
-    # ====================================================
-    probs = gerar_probabilidades_para_proximo(history, model)
+    # 1) Probabilidades do modelo (00–99)
+    probs = gerar_probabilidades_para_proximo(history, model).astype(np.float32)
     probs = np.clip(probs, 1e-9, None)
     probs = probs / probs.sum()
 
-    n_hist = len(history)
-
-    # ====================================================
-    #   FREQUÊNCIAS (QUENTES) EM MÚLTIPLAS JANELAS
-    # ====================================================
-    janela_long = min(200, n_hist)
-    freq_long = np.zeros(100, dtype=np.int32)
-    for conc in history[-janela_long:]:
-        for d in conc:
-            freq_long[d] += 1
-
-    janela10 = min(10, n_hist)
-    freq10 = np.zeros(100, dtype=np.int32)
-    for conc in history[-janela10:]:
-        for d in conc:
-            freq10[d] += 1
-
-    janela30 = min(30, n_hist)
-    freq30 = np.zeros(100, dtype=np.int32)
-    for conc in history[-janela30:]:
-        for d in conc:
-            freq30[d] += 1
-
-    # ====================================================
-    #   ATRASOS (FRIAS)
-    # ====================================================
-    atrasos = np.zeros(100, dtype=np.int32)
-    for d in range(100):
-        gap = 0
-        for conc in reversed(history):
-            if d in conc:
-                break
-            gap += 1
-        atrasos[d] = gap
-
-    # ====================================================
-    #   RUÍDO ADAPTATIVO – muda A CADA EXECUÇÃO
-    # ====================================================
-    seed = int(time.time() * 1000) % 1000000
-    rng = np.random.default_rng(seed)
-    ruido = rng.normal(0, 0.08, size=probs.shape)  # ruído um pouco maior p/ variar mais
-    probs_ruido = probs + ruido
-    probs_ruido = np.clip(probs_ruido, 1e-9, None)
-    probs_ruido = probs_ruido / probs_ruido.sum()
-
-    # ----------------------------------------------------
-    # Normalizações auxiliares
-    # ----------------------------------------------------
-    def _norm(arr: np.ndarray) -> np.ndarray:
-        arr = arr.astype(np.float32)
-        maxv = float(arr.max())
-        if maxv <= 0.0:
-            return np.zeros_like(arr, dtype=np.float32)
-        return arr / maxv
-
-    freq_long_n = _norm(freq_long)
-    freq10_n = _norm(freq10)
-    freq30_n = _norm(freq30)
-    atraso_n = _norm(atrasos)
-    probs_n = _norm(probs)
-
-    # ====================================================
-    #   APOSTA 1 – REPETIÇÃO INTELIGENTE
-    #   (poucas repetidas + top CNN/MLP)
-    # ====================================================
-    ultimo = history[-1]
-    cand_rep_ordenados = sorted(list(ultimo), key=lambda d: probs[d], reverse=True)
-    n_rep = min(12, len(cand_rep_ordenados))  # limita repetição para não "colar" demais
-    base_ap1 = cand_rep_ordenados[:n_rep]
-
-    restantes_ordem = [int(d) for d in np.argsort(-probs) if d not in base_ap1]
-    aposta1 = base_ap1 + restantes_ordem[: (50 - len(base_ap1))]
-    aposta1 = sorted(aposta1)
-
-    # ====================================================
-    #   APOSTA 2 – CICLOS (atraso forte + probabilidade)
-    #   Diversificada em relação à Aposta 1
-    # ====================================================
-    ciclo_score = (probs_n ** 0.7) * (1.0 + atraso_n * 1.5)
-    idx_ciclo_pool = np.argsort(ciclo_score)[-70:]  # pool maior
-
-    aposta2 = []
-    usados_ap1 = set(aposta1)
-    for d in reversed(idx_ciclo_pool):
-        if d in usados_ap1:
-            continue
-        aposta2.append(int(d))
-        if len(aposta2) == 50:
-            break
-
-    if len(aposta2) < 50:
-        usados = set(aposta2)
-        for d in np.argsort(ciclo_score)[::-1]:
-            if d in usados:
-                continue
-            aposta2.append(int(d))
-            if len(aposta2) == 50:
-                break
-
-    aposta2 = sorted(aposta2)
-
-    # ====================================================
-    #   APOSTA 3 – PROBABILÍSTICA REAL
-    #   (amostragem nas probs com ruído + tempering)
-    # ====================================================
-    temp = 0.85
-    probs_temp = probs_ruido ** temp
-    probs_temp = np.clip(probs_temp, 1e-9, None)
-    probs_temp = probs_temp / probs_temp.sum()
-
-    aposta3 = sorted(rng.choice(100, size=50, replace=False, p=probs_temp))
-
-    # ====================================================
-    #   APOSTA 4 – HÍBRIDA (CNN/MLP + freq + atraso)
-    #   Evita reuso pesado de dezenas já presentes nas 1–3
-    # ====================================================
-    score_hibrido = (
-        0.6 * probs_n +
-        0.2 * atraso_n +
-        0.2 * freq_long_n
-    )
-    idx_hib_pool = np.argsort(score_hibrido)[-80:]
-
-    usados_1a3 = set(aposta1) | set(aposta2) | set(aposta3)
-    aposta4 = []
-    for d in reversed(idx_hib_pool):
-        if d in usados_1a3:
-            continue
-        aposta4.append(int(d))
-        if len(aposta4) == 50:
-            break
-
-    if len(aposta4) < 50:
-        usados = set(aposta4)
-        for d in np.argsort(score_hibrido)[::-1]:
-            if d in usados:
-                continue
-            aposta4.append(int(d))
-            if len(aposta4) == 50:
-                break
-
-    aposta4 = sorted(aposta4)
-
-    # ====================================================
-    #   APOSTA 5 – QUENTES (multi-janela 10/30/200)
-    #   f10 > f30 > f200
-    # ====================================================
-    quente_score = 0.5 * freq10_n + 0.3 * freq30_n + 0.2 * freq_long_n
-    idx_quentes_pool = np.argsort(quente_score)[-80:]
-
-    usados_1a4 = usados_1a3 | set(aposta4)
-    aposta5 = []
-    for d in reversed(idx_quentes_pool):
-        if d in usados_1a4:
-            continue
-        aposta5.append(int(d))
-        if len(aposta5) == 50:
-            break
-
-    if len(aposta5) < 50:
-        usados = set(aposta5)
-        for d in np.argsort(quente_score)[::-1]:
-            if d in usados:
-                continue
-            aposta5.append(int(d))
-            if len(aposta5) == 50:
-                break
-
-    aposta5 = sorted(aposta5)
-
-    # ====================================================
-    #   APOSTA 6 – FRIAS (baixa freq + atraso alto)
-    #   Evita reuso das demais, com ruído leve para não "travar"
-    # ====================================================
-    frias_score_base = 0.6 * atraso_n + 0.4 * (1.0 - freq_long_n)
-
-    # Ruído bem leve só nas frias, para mudar um pouco a cada /gerar,
-    # sem descaracterizar o conceito de "fria".
-    ruido_frias = rng.normal(0, 0.02, size=frias_score_base.shape)
-    frias_score = frias_score_base + ruido_frias
-
-    idx_frias_pool = np.argsort(frias_score)[-80:]  # maiores scores = mais "frias relevantes"
-
-    usados_1a5 = usados_1a4 | set(aposta5)
-    aposta6 = []
-    for d in reversed(idx_frias_pool):
-        if d in usados_1a5:
-            continue
-        aposta6.append(int(d))
-        if len(aposta6) == 50:
-            break
-
-    if len(aposta6) < 50:
-        usados = set(aposta6)
-        for d in np.argsort(frias_score)[::-1]:
-            if d in usados:
-                continue
-            aposta6.append(int(d))
-            if len(aposta6) == 50:
-                break
-
-    aposta6 = sorted(aposta6)
-
-    # ====================================================
-    #   ANCORAGEM 70/30 NA APOSTA CAMPEÃ (se houver recorde >= 15)
-    # ====================================================
-    apostas = [aposta1, aposta2, aposta3, aposta4, aposta5, aposta6]
-
-    best_info = carregar_melhor_info()
-    best_hits = int(best_info.get("best_hits", 0))
-    best_pattern = best_info.get("best_pattern") or []
-    best_ap_index = int(best_info.get("best_ap_index", 0))
-
-    if best_hits >= 15 and isinstance(best_pattern, list) and len(best_pattern) >= 10:
-        idx_anchor = best_ap_index - 1  # converter 1..6 -> 0..5
-        if 0 <= idx_anchor < len(apostas):
-            # garante conjunto válido de dezenas
-            campea = sorted({int(d) for d in best_pattern if 0 <= int(d) <= 99})
-            if len(campea) > 0:
-                n_total = 50
-                frac_fixo = 0.70
-                n_fixo = min(len(campea), int(round(n_total * frac_fixo)))
-
-                # fixa as dezenas da campeã com maior probabilidade atual
-                campea_ordenada = sorted(campea, key=lambda d: probs[d], reverse=True)
-                fixas = campea_ordenada[:n_fixo]
-                fixas_set = set(fixas)
-
-                # preenche o restante com dezenas de maior probabilidade fora do conjunto fixo
-                variavel = []
-                for d in np.argsort(-probs):
-                    d_int = int(d)
-                    if d_int in fixas_set:
-                        continue
-                    variavel.append(d_int)
-                    if len(fixas) + len(variavel) == n_total:
-                        break
-
-                aposta_ancorada = sorted(fixas + variavel)
-                apostas[idx_anchor] = aposta_ancorada
-
-    # ====================================================
-    #   FILTRO FINAL ESTRUTURAL (pós-processamento)
-    #   - NÃO escolhe dezenas "mágicas": só ajusta COMPOSIÇÃO
-    #   - Trocas mínimas guiadas pelo score de cada estratégia
-    #   - Preserva a ANCORAGEM (trava as dezenas fixas quando houver)
-    #
-    # Regras (para 50 dezenas):
-    # - Pares: 23 a 27
-    # - Múltiplos de 3: 15 a 18
-    # - Fibonacci: 6 a 10
-    # ====================================================
-
-    FIBO_SET = {0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89}
-
-    EVEN_MIN, EVEN_MAX = 23, 27
-    M3_MIN, M3_MAX = 15, 18
-    FIBO_MIN, FIBO_MAX = 6, 10
-
-    def _count_even(nums):
-        return sum(1 for d in nums if d % 2 == 0)
-
-    def _count_mult3(nums):
-        return sum(1 for d in nums if d % 3 == 0)
-
-    def _count_fibo(nums):
-        return sum(1 for d in nums if d in FIBO_SET)
-
-    def _ensure50_set(s, score_vec):
-        # garante 50 sem alterar o estilo: remove piores, adiciona melhores (fora do set)
-        if len(s) > 50:
-            # remove os de menor score
-            rest = sorted(list(s), key=lambda d: float(score_vec[d]))
-            return set(rest[-50:])
-        if len(s) < 50:
-            # adiciona os melhores fora do set
-            add = [d for d in np.argsort(-score_vec) if int(d) not in s]
-            need = 50 - len(s)
-            for d in add[:need]:
-                s.add(int(d))
-        return s
-
-    def _final_filter_structural(nums, score_vec, locked_set):
-        s = set(int(x) for x in nums)
-        s = _ensure50_set(s, score_vec)
-
-        evens_all = [d for d in range(100) if d % 2 == 0]
-        odds_all = [d for d in range(100) if d % 2 == 1]
-        mult3_all = [d for d in range(100) if d % 3 == 0]
-        nonmult3_all = [d for d in range(100) if d % 3 != 0]
-        fibo_all = list(FIBO_SET)
-        nonfibo_all = [d for d in range(100) if d not in FIBO_SET]
-
-        def best_add(cands):
-            cands = [d for d in cands if d not in s]
-            if not cands:
-                return None
-            cands.sort(key=lambda d: float(score_vec[d]), reverse=True)
-            return cands[0]
-
-        def worst_remove(cands):
-            cands = [d for d in cands if d in s and d not in locked_set]
-            if not cands:
-                return None
-            cands.sort(key=lambda d: float(score_vec[d]))  # menor score sai primeiro
-            return cands[0]
-
-        for _ in range(160):
-            cur = sorted(s)
-            ev = _count_even(cur)
-            m3 = _count_mult3(cur)
-            fb = _count_fibo(cur)
-
-            if (EVEN_MIN <= ev <= EVEN_MAX) and (M3_MIN <= m3 <= M3_MAX) and (FIBO_MIN <= fb <= FIBO_MAX):
-                break
-
-            # pares/ímpares
-            if ev > EVEN_MAX:
-                out = worst_remove([d for d in s if d % 2 == 0])
-                inn = best_add(odds_all)
-                if out is not None and inn is not None:
-                    s.remove(out); s.add(inn); continue
-
-            if ev < EVEN_MIN:
-                out = worst_remove([d for d in s if d % 2 == 1])
-                inn = best_add(evens_all)
-                if out is not None and inn is not None:
-                    s.remove(out); s.add(inn); continue
-
-            # múltiplos de 3
-            if m3 > M3_MAX:
-                out = worst_remove([d for d in s if d % 3 == 0])
-                inn = best_add(nonmult3_all)
-                if out is not None and inn is not None:
-                    s.remove(out); s.add(inn); continue
-
-            if m3 < M3_MIN:
-                out = worst_remove([d for d in s if d % 3 != 0])
-                inn = best_add(mult3_all)
-                if out is not None and inn is not None:
-                    s.remove(out); s.add(inn); continue
-
-            # fibonacci
-            if fb > FIBO_MAX:
-                out = worst_remove([d for d in s if d in FIBO_SET])
-                inn = best_add(nonfibo_all)
-                if out is not None and inn is not None:
-                    s.remove(out); s.add(inn); continue
-
-            if fb < FIBO_MIN:
-                out = worst_remove([d for d in s if d not in FIBO_SET])
-                inn = best_add(fibo_all)
-                if out is not None and inn is not None:
-                    s.remove(out); s.add(inn); continue
-
-            # fallback: troca neutra (se travar por locked)
-            removable = [d for d in s if d not in locked_set]
-            if not removable:
-                break
-            removable.sort(key=lambda d: float(score_vec[d]))
-            out = removable[0]
-            candidates = [d for d in range(100) if d not in s]
-            candidates.sort(key=lambda d: float(score_vec[d]), reverse=True)
-            inn = candidates[0] if candidates else None
-            if inn is None:
-                break
-            s.remove(out); s.add(inn)
-
-        # garante locked e 50
-        s |= set(locked_set)
-
-        if len(s) > 50:
-            # remove apenas fora do locked
-            removable = [d for d in s if d not in locked_set]
-            removable.sort(key=lambda d: float(score_vec[d]))  # piores primeiro
-            while len(s) > 50 and removable:
-                s.remove(removable.pop(0))
-
-        if len(s) < 50:
-            # adiciona melhores fora do set
-            add = [int(d) for d in np.argsort(-score_vec) if int(d) not in s]
-            need = 50 - len(s)
-            for d in add[:need]:
-                s.add(int(d))
-
-        return sorted(list(s))
-
-    # score vetorial por estratégia (guia as trocas)
-    score1 = probs.astype(np.float64)                 # aposta 1: top probs reais
-    score2 = ciclo_score.astype(np.float64)           # aposta 2: ciclos
-    score3 = probs_temp.astype(np.float64)            # aposta 3: probs com ruído/tempering
-    score4 = score_hibrido.astype(np.float64)         # aposta 4: híbrida
-    score5 = quente_score.astype(np.float64)          # aposta 5: quentes
-    score6 = frias_score.astype(np.float64)           # aposta 6: frias
-
-    # trava somente a parte fixa da ancoragem, se estiver ativa
-    locked_sets = [set(), set(), set(), set(), set(), set()]
-    if best_hits >= 15 and isinstance(best_pattern, list) and len(best_pattern) >= 10:
-        idx_anchor = best_ap_index - 1
-        if 0 <= idx_anchor < 6:
-            # recomputa o mesmo conjunto fixo usado na ancoragem (70% do pattern ordenado por prob)
-            campea = sorted({int(d) for d in best_pattern if 0 <= int(d) <= 99})
-            if len(campea) > 0:
-                n_fixo = min(len(campea), int(round(50 * 0.70)))
-                campea_ordenada = sorted(campea, key=lambda d: probs[d], reverse=True)
-                fixas_set = set(campea_ordenada[:n_fixo])
-                locked_sets[idx_anchor] = fixas_set
-
-    apostas[0] = _final_filter_structural(apostas[0], score1, locked_sets[0])
-    apostas[1] = _final_filter_structural(apostas[1], score2, locked_sets[1])
-    apostas[2] = _final_filter_structural(apostas[2], score3, locked_sets[2])
-    apostas[3] = _final_filter_structural(apostas[3], score4, locked_sets[3])
-    apostas[4] = _final_filter_structural(apostas[4], score5, locked_sets[4])
-    apostas[5] = _final_filter_structural(apostas[5], score6, locked_sets[5])
-
-
-    # ====================================================
-    #   ESPELHOS
-    # ====================================================
+    # 2) Bias aprendido (penalidades) – interpretado como: positivo = favorece, negativo = desfavorece
+    penalidades = carregar_penalidades()
+    bias = np.zeros(100, dtype=np.float32)
+    for d, v in penalidades.items():
+        if 0 <= int(d) <= 99:
+            bias[int(d)] = float(v)
+
+    # 3) Combina em logit (mais estável que mexer direto no p)
+    #    bias_strength controla o quanto o aprendizado influencia a geração
+    bias_strength = 0.65
+    temperature = 1.05  # >1 espalha mais; <1 concentra mais
+
+    logits = np.log(probs) + bias_strength * bias
+    probs_adj = _softmax(logits / temperature)
+
+    rng = np.random.default_rng(int(time.time() * 1000) % 1_000_000)
+
+    # 4) Gerador de bilhete com diversidade: penaliza sobreposição com bilhetes já gerados
+    def _gerar_bilhete(diversity_lambda: float, noise: float) -> List[int]:
+        escolhidas: list[int] = []
+        usadas = set()
+
+        # contagem de sobreposição por dezena com bilhetes anteriores
+        overlap_count = np.zeros(100, dtype=np.float32)
+        for ap in apostas:
+            for d in ap:
+                overlap_count[d] += 1.0
+
+        # greedy-stochastic: a cada passo escolhe a melhor dezena ainda não usada
+        for _ in range(50):
+            # score = logit + ruido - lambda*overlap
+            score = logits.copy()
+            if noise > 0:
+                score = score + rng.normal(0.0, noise, size=score.shape).astype(np.float32)
+            score = score - diversity_lambda * overlap_count
+
+            # invalida já usadas
+            score[list(usadas)] = -1e9
+
+            d = int(np.argmax(score))
+            usadas.add(d)
+            escolhidas.append(d)
+
+        escolhidas.sort()
+        return escolhidas
+
+    # 5) Constrói 6 apostas
+    apostas: list[list[int]] = []
+
+    # Aposta 1: exploração pura (top 50)
+    idx_sorted = np.argsort(-probs_adj).tolist()
+    apostas.append(sorted(idx_sorted[:50]))
+
+    # Apostas 2..6: diversidade crescente
+    for i in range(2, 7):
+        # mais diversidade nos últimos bilhetes
+        div_l = 0.55 + 0.18 * (i - 2)
+        noise = 0.06 + 0.01 * (i - 2)
+        apostas.append(_gerar_bilhete(diversity_lambda=div_l, noise=noise))
+
+    # 6) Espelhos
     universo = set(range(100))
-    espelhos = [sorted(universo - set(ap)) for ap in apostas]
+    espelhos = [sorted(list(universo.difference(set(ap)))) for ap in apostas]
 
     return apostas, espelhos
 
@@ -2032,7 +1698,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /refino: Exploração agressiva com penalidades exponenciais e espelhos\n\n"
         f"Modo treino habilitado: {'SIM' if TREINO_HABILITADO else 'NÃO (apenas avaliação)'}\n"
         f"Modo intensivo: {'ATIVADO' if INTENSIVE_LEARNING else 'DESATIVADO'}\n"
-        f"Sistema de penalidades: ATIVADO (P={PENALIDADE_ERRO}, R={RECOMPENSA_ACERTO_ERRAR})"
+        f"Sistema de penalidades: ATIVADO (P={PENALIDADE_ERRO}, B={BONUS_ACERTO})"
     )
     await update.message.reply_text(msg)
 
@@ -2433,7 +2099,7 @@ async def confirmar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             history = load_history(HISTORY_PATH)
             if history is not None:
-                treino_incremental_pos_concurso(history, resultado_set, modo)
+                treino_incremental_pos_concurso(history, resultado_set, modo, aposta_ref=set(apostas_py[melhor_ap_idx]))
                 txt_treino = (
                     f"\n🧠 Treino incremental INTENSIVO aplicado ao modelo (CNN+MLP).\n"
                     f"   • Melhor aposta do lote: {melhor_hits} acertos\n"
