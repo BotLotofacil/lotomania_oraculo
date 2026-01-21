@@ -26,27 +26,21 @@ from telegram.ext import (
 BLOCKED_USERS = {848572364}  # user_id bloqueado
 
 
-# ----------------------------------------------------
-# Caminhos de arquivos principais
-# ----------------------------------------------------
-HISTORY_PATH = "lotomania_historico_onehot.csv"   # histórico one-hot (00–99)
-MODEL_PATH = "lotomania_model.npz"                # pesos da rede neural (modelo atual)
+# ===============================
+# Persistência de dados (Railway)
+# ===============================
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Snapshot do melhor modelo já visto (para você poder voltar se quiser)
-BEST_MODEL_PATH = "lotomania_model_best.npz"
-BEST_SCORE_PATH = "lotomania_best_score.json"
-
-# Arquivo para guardar o último lote gerado (para o /confirmar)
-ULTIMA_GERACAO_PATH = "ultima_geracao_oraculo.json"
-
-# Arquivo de telemetria de desempenho
-DESEMPENHO_PATH = "desempenho_oraculo.csv"
-
-# Arquivo de whitelist (user_ids autorizados)
-WHITELIST_PATH = "whitelist.txt"
-
-# Arquivo para registro de penalidades (aprendizado negativo)
-PENALIDADES_PATH = "penalidades_oraculo.json"
+HISTORY_PATH = os.path.join(DATA_DIR, "lotomania_historico_onehot.csv")
+MODEL_PATH = os.path.join(DATA_DIR, "lotomania_model.npz")
+BEST_MODEL_PATH = os.path.join(DATA_DIR, "lotomania_model_best.npz")
+BEST_SCORE_PATH = os.path.join(DATA_DIR, "lotomania_best_score.json")
+ULTIMA_GERACAO_PATH = os.path.join(DATA_DIR, "ultima_geracao_oraculo.json")
+DESEMPENHO_PATH = os.path.join(DATA_DIR, "desempenho_oraculo.csv")
+PENALIDADES_PATH = os.path.join(DATA_DIR, "penalidades_oraculo.json")
+WHITELIST_PATH = os.path.join(DATA_DIR, "whitelist.txt")
+BLOCKED_PATH = os.path.join(DATA_DIR, "blocked_users.json")
 
 # ----------------------------------------------------
 # CONFIGURAÇÃO GLOBAL DE APRENDIZADO
