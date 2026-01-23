@@ -42,6 +42,52 @@ PENALIDADES_PATH = os.path.join(DATA_DIR, "penalidades_oraculo.json")
 WHITELIST_PATH = os.path.join(DATA_DIR, "whitelist.txt")
 BLOCKED_PATH = os.path.join(DATA_DIR, "blocked_users.json")
 
+
+# ===============================
+# Bootstrap: sincroniza arquivos do REPO -> VOLUME
+# (o GitHub é a fonte da verdade)
+# ===============================
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_HISTORY_PATH = os.path.join(REPO_DIR, "lotomania_historico_onehot.csv")
+REPO_WHITELIST_PATH = os.path.join(REPO_DIR, "whitelist.txt")
+
+
+def _count_lines(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return sum(1 for _ in f)
+    except FileNotFoundError:
+        return 0
+
+
+def bootstrap_repo_files_to_volume():
+    # 🔹 Histórico: se o repo tem mais linhas que o volume (ou volume não existe), copia
+    if os.path.exists(REPO_HISTORY_PATH):
+        repo_lines = _count_lines(REPO_HISTORY_PATH)
+        volume_lines = _count_lines(HISTORY_PATH)
+
+        if repo_lines > volume_lines:
+            shutil.copy2(REPO_HISTORY_PATH, HISTORY_PATH)
+            logger.info(
+                "Histórico sincronizado do repo para o volume: %s → %s",
+                REPO_HISTORY_PATH,
+                HISTORY_PATH,
+            )
+
+    # 🔹 Whitelist: se existe no repo e não existe no volume, copia
+    if os.path.exists(REPO_WHITELIST_PATH) and not os.path.exists(WHITELIST_PATH):
+        shutil.copy2(REPO_WHITELIST_PATH, WHITELIST_PATH)
+        logger.info(
+            "Whitelist copiada do repo para o volume: %s → %s",
+            REPO_WHITELIST_PATH,
+            WHITELIST_PATH,
+        )
+
+
+# Executa o bootstrap na inicialização do bot
+bootstrap_repo_files_to_volume()
+
+
 # ----------------------------------------------------
 # CONFIGURAÇÃO GLOBAL DE APRENDIZADO
 # ----------------------------------------------------
