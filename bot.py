@@ -23,7 +23,7 @@ from telegram.ext import (
 # BLOQUEIO TOTAL GLOBAL (BLACKLIST)
 # ================================
 
-BLOCKED_USERS = {848572364}  # user_id bloqueado
+BLOCKED_USERS = {}  # user_id bloqueado
 
 
 # ===============================
