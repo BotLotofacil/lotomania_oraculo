@@ -1,0 +1,37 @@
+name: Atualizar CSV Lotomania (auto)
+
+on:
+  schedule:
+    # roda todo dia 01:25 UTC (22:25 BRT aprox). Ajuste se quiser.
+    - cron: "25 1 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update-csv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Rodar script de atualização
+        run: python scripts/update_lotomania_csv.py
+
+      - name: Commit e push se houver mudanças
+        run: |
+          if git diff --quiet; then
+            echo "Sem alterações no CSV."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lotomania_historico_onehot.csv
+          git commit -m "Atualiza lotomania_historico_onehot.csv (auto)"
+          git push
