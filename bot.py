@@ -43,6 +43,114 @@ WHITELIST_PATH = os.path.join(DATA_DIR, "whitelist.txt")
 BLOCKED_PATH = os.path.join(DATA_DIR, "blocked_users.json")
 
 
+# marcador do último concurso processado (alert/treino)
+LAST_SEEN_CONCURSO_PATH = os.path.join(DATA_DIR, "last_seen_concurso.txt")
+
+
+def _read_last_seen_concurso() -> int:
+    try:
+        with open(LAST_SEEN_CONCURSO_PATH, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+def _write_last_seen_concurso(concurso: int) -> None:
+    try:
+        with open(LAST_SEEN_CONCURSO_PATH, "w", encoding="utf-8") as f:
+            f.write(str(int(concurso)))
+    except Exception:
+        pass
+
+def _get_max_concurso_from_csv(csv_path: str) -> int:
+    # lê a 1ª coluna "concurso" e pega o maior
+    if not os.path.exists(csv_path):
+        return 0
+    mx = 0
+    try:
+        with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i == 0:
+                    continue  # header
+                parts = line.strip().split(";")
+                if not parts or not parts[0].isdigit():
+                    continue
+                c = int(parts[0])
+                if c > mx:
+                    mx = c
+    except Exception:
+        return 0
+    return mx
+
+
+async def _alert_and_train_if_new_result(app):
+    """
+    Roda no startup do bot.
+    Se o CSV tiver concurso maior do que o 'last_seen', manda alerta e (opcional) treina.
+    """
+    try:
+        auto_alert = os.getenv("AUTO_ALERT_ON_NEW_RESULT", "1") == "1"
+        auto_train = os.getenv("AUTO_TRAIN_ON_NEW_RESULT", "0") == "1"
+        alert_chat_id = os.getenv("ALERT_CHAT_ID", "").strip()
+
+        max_csv = _get_max_concurso_from_csv(HISTORY_PATH)
+        last_seen = _read_last_seen_concurso()
+
+        logger.info("Bootstrap update-check: last_seen=%s max_csv=%s HISTORY_PATH=%s", last_seen, max_csv, HISTORY_PATH)
+
+        # primeira execução: só marca e não spamma alerta
+        if last_seen == 0 and max_csv > 0:
+            _write_last_seen_concurso(max_csv)
+            logger.info("Primeira execução: marcando last_seen=%s (sem alertar).", max_csv)
+            return
+
+        if max_csv <= last_seen:
+            return  # nada novo
+
+        # temos concurso(s) novo(s)
+        new_from = last_seen + 1
+        new_to = max_csv
+
+        if auto_alert and alert_chat_id:
+            msg = (
+                f"🆕 Lotomania: CSV atualizado!\n"
+                f"Novos concursos: {new_from} → {new_to}\n"
+                f"📄 Fonte: lotomania_historico_onehot.csv\n"
+            )
+            await app.bot.send_message(chat_id=alert_chat_id, text=msg)
+
+        # treino automático (se habilitado)
+        if auto_train:
+            # Aqui a gente chama sua função de treino incremental existente no seu bot
+            # Ajuste o nome se no seu bot estiver diferente.
+            logger.info("AUTO_TRAIN: iniciando treino incremental pós-concurso(s) novo(s).")
+
+            # EXEMPLO: se você já tem uma função tipo treino_incremental_pos_concurso(janela=..., epocas=..., modo=...)
+            # Troque o nome abaixo para bater com seu bot.
+            try:
+                # use configurações mais seguras pro Railway (não travar CPU)
+                # você pode subir depois se quiser
+                treino_incremental_pos_concurso(modo="auto", epocas=30, janela=60)
+                logger.info("AUTO_TRAIN: treino concluído com sucesso.")
+                if auto_alert and alert_chat_id:
+                    await app.bot.send_message(
+                        chat_id=alert_chat_id,
+                        text=f"🧠 Treino automático concluído após atualização até o concurso {max_csv}."
+                    )
+            except Exception as e:
+                logger.exception("AUTO_TRAIN: erro no treino: %s", e)
+                if auto_alert and alert_chat_id:
+                    await app.bot.send_message(
+                        chat_id=alert_chat_id,
+                        text=f"⚠️ Treino automático falhou após atualização (concurso {max_csv}). Veja logs no Railway."
+                    )
+
+        # marca como processado
+        _write_last_seen_concurso(max_csv)
+
+    except Exception as e:
+        logger.exception("Erro no check de atualização/treino: %s", e)
+
+
 # ===============================
 # Bootstrap: sincroniza arquivos do REPO -> VOLUME
 # (o GitHub é a fonte da verdade)
@@ -3071,6 +3179,7 @@ def main():
         raise RuntimeError("Defina a variável de ambiente TELEGRAM_BOT_TOKEN.")
 
     app = ApplicationBuilder().token(token).build()
+    app.post_init = _alert_and_train_if_new_result
 
     # BLOQUEIO GLOBAL — roda antes de qualquer comando
     app.add_handler(
