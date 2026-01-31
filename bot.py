@@ -95,7 +95,10 @@ async def _alert_and_train_if_new_result(app):
         max_csv = _get_max_concurso_from_csv(HISTORY_PATH)
         last_seen = _read_last_seen_concurso()
 
-        logger.info("Bootstrap update-check: last_seen=%s max_csv=%s HISTORY_PATH=%s", last_seen, max_csv, HISTORY_PATH)
+        logger.info(
+            "Bootstrap update-check: last_seen=%s max_csv=%s HISTORY_PATH=%s",
+            last_seen, max_csv, HISTORY_PATH
+        )
 
         # primeira execução: só marca e não spamma alerta
         if last_seen == 0 and max_csv > 0:
@@ -120,22 +123,31 @@ async def _alert_and_train_if_new_result(app):
 
         # treino automático (se habilitado)
         if auto_train:
-            # Aqui a gente chama sua função de treino incremental existente no seu bot
-            # Ajuste o nome se no seu bot estiver diferente.
             logger.info("AUTO_TRAIN: iniciando treino incremental pós-concurso(s) novo(s).")
-
-            # EXEMPLO: se você já tem uma função tipo treino_incremental_pos_concurso(janela=..., epocas=..., modo=...)
-            # Troque o nome abaixo para bater com seu bot.
             try:
-                # use configurações mais seguras pro Railway (não travar CPU)
-                # você pode subir depois se quiser
-                treino_incremental_pos_concurso(modo="auto", epocas=30, janela=60)
+                # carrega o histórico já atualizado (do volume)
+                history = load_history(HISTORY_PATH)
+
+                if not history:
+                    raise RuntimeError("AUTO_TRAIN: histórico vazio. Não há como treinar.")
+
+                # último concurso (mais recente) vira o 'resultado confirmado' do treino
+                resultado_set = history[-1]
+
+                # chama o treino incremental com a assinatura correta
+                treino_incremental_pos_concurso(
+                    history,
+                    resultado_set,
+                    modo_treino="auto",
+                )
+
                 logger.info("AUTO_TRAIN: treino concluído com sucesso.")
                 if auto_alert and alert_chat_id:
                     await app.bot.send_message(
                         chat_id=alert_chat_id,
                         text=f"🧠 Treino automático concluído após atualização até o concurso {max_csv}."
                     )
+
             except Exception as e:
                 logger.exception("AUTO_TRAIN: erro no treino: %s", e)
                 if auto_alert and alert_chat_id:
@@ -144,7 +156,7 @@ async def _alert_and_train_if_new_result(app):
                         text=f"⚠️ Treino automático falhou após atualização (concurso {max_csv}). Veja logs no Railway."
                     )
 
-        # marca como processado
+        # marca como processado (mesmo que o treino falhe, evita loop infinito)
         _write_last_seen_concurso(max_csv)
 
     except Exception as e:
