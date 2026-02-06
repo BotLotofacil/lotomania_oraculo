@@ -205,7 +205,6 @@ def bootstrap_repo_files_to_volume():
 
 
 # Executa o bootstrap na inicialização do bot
-bootstrap_repo_files_to_volume()
 
 
 # ----------------------------------------------------
@@ -241,6 +240,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Executa o bootstrap de sincronização (repo -> volume) APÓS o logger existir
+bootstrap_repo_files_to_volume()
 
 # Cache simples para whitelist em memória (recarregado a cada uso rápido)
 _whitelist_cache: set[int] | None = None
